@@ -26,11 +26,12 @@
 #include <system/audio.h>
 
 #include <media/hardware/MetadataBufferType.h>
-#include <android/media/permission/Identity.h>
-
-using namespace android::media::permission;
+#include <media/stagefright/foundation/AString.h>
+#include <android/content/AttributionSourceState.h>
 
 namespace android {
+
+using content::AttributionSourceState;
 
 class Camera;
 class ICameraRecordingProxy;
@@ -45,7 +46,7 @@ class MediaProfiles;
 struct ALooper;
 
 struct StagefrightRecorder : public MediaRecorderBase {
-    explicit StagefrightRecorder(const Identity& clientIdentity);
+    explicit StagefrightRecorder(const AttributionSourceState& attributionSource);
     virtual ~StagefrightRecorder();
     virtual status_t init();
     virtual status_t setLogSessionId(const String8 &id);
@@ -152,6 +153,7 @@ private:
     int32_t mRTPCVOExtMap;
     int32_t mRTPCVODegrees;
     int32_t mRTPSockDscp;
+    int32_t mRTPSockOptEcn;
     int64_t mRTPSockNetwork;
     uint32_t mLastSeqNo;
 
@@ -246,6 +248,7 @@ private:
     status_t setRTPCVOExtMap(int32_t extmap);
     status_t setRTPCVODegrees(int32_t cvoDegrees);
     status_t setParamRtpDscp(int32_t dscp);
+    status_t setParamRtpEcn(int32_t ecn);
     status_t setSocketNetwork(int64_t networkHandle);
     status_t requestIDRFrame();
     void clipVideoBitRate();

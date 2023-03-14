@@ -114,6 +114,16 @@ public:
             }
             return info && info.transfer == C2Color::TRANSFER_170M;
         }
+
+        static c2_status_t QueryParamsForPreviousComponent(
+                [[maybe_unused]] const std::shared_ptr<C2ComponentInterface> &intf,
+                std::vector<std::unique_ptr<C2Param>> *params) {
+            params->emplace_back(new C2StreamUsageTuning::output(
+                    0u, C2AndroidMemoryUsage::HW_TEXTURE_READ));
+            params->emplace_back(new C2StreamPixelFormatInfo::output(
+                    0u, HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED));
+            return C2_OK;
+        }
     private:
         const c2_node_id_t mId;
         std::shared_ptr<C2ReflectorHelper> mReflector;
@@ -616,6 +626,14 @@ private:
             }
             LOG(VERBOSE) << "work #" << workCount << ": flags=" << work->input.flags
                     << " timestamp=" << work->input.ordinal.timestamp.peek();;
+
+            std::vector<C2Param *> configUpdate;
+            for (const std::unique_ptr<C2Param> &param : work->input.configUpdate) {
+                configUpdate.push_back(param.get());
+            }
+            std::vector<std::unique_ptr<C2SettingResult>> failures;
+            mIntf->config_vb(configUpdate, C2_MAY_BLOCK, &failures);
+
             std::shared_ptr<C2StreamHdrStaticInfo::input> hdrStaticInfo =
                 mIntf->getHdrStaticMetadata();
             uint32_t dataspace = mIntf->getDataSpace();
@@ -789,7 +807,8 @@ const FilterPlugin_V1::Descriptor SampleToneMappingFilter::Interface::DESCRIPTOR
     // affectedParams
     {
         C2StreamHdrStaticInfo::output::PARAM_TYPE,
-        C2StreamHdr10PlusInfo::output::PARAM_TYPE,
+        C2StreamHdr10PlusInfo::output::PARAM_TYPE,  // will be deprecated
+        C2StreamHdrDynamicMetadataInfo::output::PARAM_TYPE,
         C2StreamColorAspectsInfo::output::PARAM_TYPE,
     },
 };
@@ -944,6 +963,16 @@ public:
             return SampleToneMappingFilter::Interface::IsFilteringEnabled(intf);
         }
         return false;
+    }
+
+    c2_status_t queryParamsForPreviousComponent(
+            const std::shared_ptr<C2ComponentInterface> &intf,
+            std::vector<std::unique_ptr<C2Param>> *params) override {
+        if (intf->getName() == SampleToneMappingFilter::Interface::NAME) {
+            return SampleToneMappingFilter::Interface::QueryParamsForPreviousComponent(
+                    intf, params);
+        }
+        return C2_BAD_VALUE;
     }
 
 private:

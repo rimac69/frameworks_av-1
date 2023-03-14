@@ -16,13 +16,18 @@
 
 //#define LOG_NDEBUG 0
 #define LOG_TAG "ARTPConnection"
+#define INET_ECN_NOT_ECT    0x00    /* ECN was not enabled */
+#define INET_ECN_ECT_1      0x01    /* ECN capable packet */
+#define INET_ECN_ECT_0      0x02    /* ECN capable packet */
+#define INET_ECN_CE         0x03    /* ECN congestion */
+#define INET_ECN_MASK       0x03    /* Mask of ECN bits */
+
 #include <utils/Log.h>
 
-#include "ARTPAssembler.h"
-#include "ARTPConnection.h"
-
-#include "ARTPSource.h"
-#include "ASessionDescription.h"
+#include <media/stagefright/rtsp/ARTPAssembler.h>
+#include <media/stagefright/rtsp/ARTPConnection.h>
+#include <media/stagefright/rtsp/ARTPSource.h>
+#include <media/stagefright/rtsp/ASessionDescription.h>
 
 #include <media/stagefright/foundation/ABuffer.h>
 #include <media/stagefright/foundation/ADebug.h>
@@ -43,6 +48,10 @@ static uint16_t u16at(const uint8_t *data) {
     return data[0] << 8 | data[1];
 }
 
+static uint32_t u24at(const uint8_t *data) {
+    return u16at(data) << 16 | data[2];
+}
+
 static uint32_t u32at(const uint8_t *data) {
     return u16at(data) << 16 | u16at(&data[2]);
 }
@@ -53,6 +62,7 @@ static uint64_t u64at(const uint8_t *data) {
 
 // static
 const int64_t ARTPConnection::kSelectTimeoutUs = 1000LL;
+const int64_t ARTPConnection::kMinOneSecondNotifyDelayUs = 100000ll;
 
 struct ARTPConnection::StreamInfo {
     bool isIPv6;
@@ -70,6 +80,8 @@ struct ARTPConnection::StreamInfo {
 
     bool mIsInjected;
 
+    // A place to save time when it polls
+    int64_t mLastPollTimeUs;
     // RTCP Extension for CVO
     int mCVOExtMap; // will be set to 0 if cvo is not negotiated in sdp
 };
@@ -79,8 +91,11 @@ ARTPConnection::ARTPConnection(uint32_t flags)
       mPollEventPending(false),
       mLastReceiverReportTimeUs(-1),
       mLastBitrateReportTimeUs(-1),
+      mLastCongestionNotifyTimeUs(-1),
       mTargetBitrate(-1),
-      mJbTimeMs(300) {
+      mRtpSockOptEcn(0),
+      mIsIPv6(false),
+      mStaticJitterTimeMs(kStaticJitterTimeMs) {
 }
 
 ARTPConnection::~ARTPConnection() {
@@ -99,6 +114,11 @@ void ARTPConnection::addStream(
     msg->setSize("index", index);
     msg->setMessage("notify", notify);
     msg->setInt32("injected", injected);
+    msg->post();
+}
+
+void ARTPConnection::seekStream() {
+    sp<AMessage> msg = new AMessage(kWhatSeekStream, this);
     msg->post();
 }
 
@@ -165,7 +185,7 @@ void ARTPConnection::MakePortPair(
 // static
 void ARTPConnection::MakeRTPSocketPair(
         int *rtpSocket, int *rtcpSocket, const char *localIp, const char *remoteIp,
-        unsigned localPort, unsigned remotePort, int64_t socketNetwork) {
+        unsigned localPort, unsigned remotePort, int64_t socketNetwork, int32_t sockOptEcn) {
     bool isIPv6 = false;
     if (strchr(localIp, ':') != NULL)
         isIPv6 = true;
@@ -191,6 +211,24 @@ void ARTPConnection::MakeRTPSocketPair(
         if (result != 0) {
             ALOGW("failed(%d) to bind rtcp socket(%d) to network(%llu)",
                     result, *rtcpSocket, (unsigned long long)socketNetwork);
+        }
+    }
+
+    if (sockOptEcn != 0) {
+        int sockOptForTOS = 1;
+        if (setsockopt(*rtpSocket, isIPv6 ? IPPROTO_IPV6 : IPPROTO_IP,
+               isIPv6 ? IPV6_RECVTCLASS : IP_RECVTOS,
+               (int *)&sockOptForTOS, sizeof(sockOptForTOS)) < 0) {
+            ALOGE("failed to set recv sockopt TOS on rtpsock(%d). err=%s", *rtpSocket,
+                strerror(errno));
+        } else {
+            ALOGD("successfully set recv sockopt TOS on rtpsock(%d)", *rtpSocket);
+            int result = setsockopt(*rtcpSocket, isIPv6 ? IPPROTO_IPV6 : IPPROTO_IP,
+                isIPv6 ? IPV6_RECVTCLASS : IP_RECVTOS,
+                (int *)&sockOptForTOS, sizeof(sockOptForTOS));
+            if (result >= 0) {
+                ALOGD("successfully set recv sockopt TOS on rtcpsock(%d).", *rtcpSocket);
+            }
         }
     }
 
@@ -281,6 +319,12 @@ void ARTPConnection::onMessageReceived(const sp<AMessage> &msg) {
             break;
         }
 
+        case kWhatSeekStream:
+        {
+            onSeekStream(msg);
+            break;
+        }
+
         case kWhatRemoveStream:
         {
             onRemoveStream(msg);
@@ -290,6 +334,12 @@ void ARTPConnection::onMessageReceived(const sp<AMessage> &msg) {
         case kWhatPollStreams:
         {
             onPollStreams();
+            break;
+        }
+
+        case kWhatAlarmStream:
+        {
+            onAlarmStream(msg);
             break;
         }
 
@@ -348,6 +398,18 @@ void ARTPConnection::onAddStream(const sp<AMessage> &msg) {
 
     if (!injected) {
         postPollEvent();
+    }
+}
+
+void ARTPConnection::onSeekStream(const sp<AMessage> &msg) {
+    (void)msg; // unused param as of now.
+    List<StreamInfo>::iterator it = mStreams.begin();
+    while (it != mStreams.end()) {
+        for (size_t i = 0; i < it->mSources.size(); ++i) {
+            sp<ARTPSource> source = it->mSources.valueAt(i);
+            source->timeReset();
+        }
+        ++it;
     }
 }
 
@@ -416,6 +478,7 @@ void ARTPConnection::onPollStreams() {
         return;
     }
 
+    int64_t nowUs = ALooper::GetNowUs();
     int res = select(maxSocket + 1, &rs, NULL, NULL, &tv);
 
     if (res > 0) {
@@ -425,6 +488,7 @@ void ARTPConnection::onPollStreams() {
                 ++it;
                 continue;
             }
+            it->mLastPollTimeUs = nowUs;
 
             status_t err = OK;
             if (FD_ISSET(it->mRTPSocket, &rs)) {
@@ -436,14 +500,16 @@ void ARTPConnection::onPollStreams() {
 
             if (err == -ECONNRESET) {
                 // socket failure, this stream is dead, Jim.
-                sp<AMessage> notify = it->mNotifyMsg->dup();
-                notify->setInt32("rtcp-event", 1);
-                notify->setInt32("payload-type", 400);
-                notify->setInt32("feedback-type", 1);
-                notify->setInt32("sender", it->mSources.valueAt(0)->getSelfID());
-                notify->post();
+                for (size_t i = 0; i < it->mSources.size(); ++i) {
+                    sp<AMessage> notify = it->mNotifyMsg->dup();
+                    notify->setInt32("rtcp-event", 1);
+                    notify->setInt32("payload-type", 400);
+                    notify->setInt32("feedback-type", 1);
+                    notify->setInt32("sender", it->mSources.valueAt(i)->getSelfID());
+                    notify->post();
 
-                ALOGW("failed to receive RTP/RTCP datagram.");
+                    ALOGW("failed to receive RTP/RTCP datagram.");
+                }
                 it = mStreams.erase(it);
                 continue;
             }
@@ -475,8 +541,6 @@ void ARTPConnection::onPollStreams() {
                     if (n != (ssize_t)buffer->size()) {
                         ALOGW("failed to send RTCP TMMBR (%s).",
                                 n >= 0 ? "connection gone" : strerror(errno));
-
-                        it = mStreams.erase(it);
                         continue;
                     }
                 }
@@ -486,7 +550,6 @@ void ARTPConnection::onPollStreams() {
         }
     }
 
-    int64_t nowUs = ALooper::GetNowUs();
     checkRxBitrate(nowUs);
 
     if (mLastReceiverReportTimeUs <= 0
@@ -528,8 +591,7 @@ void ARTPConnection::onPollStreams() {
                 if (n != (ssize_t)buffer->size()) {
                     ALOGW("failed to send RTCP receiver report (%s).",
                             n >= 0 ? "connection gone" : strerror(errno));
-
-                    it = mStreams.erase(it);
+                    ++it;
                     continue;
                 }
 
@@ -545,6 +607,13 @@ void ARTPConnection::onPollStreams() {
     }
 }
 
+void ARTPConnection::onAlarmStream(const sp<AMessage> msg) {
+    sp<ARTPSource> source = nullptr;
+    if (msg->findObject("source", (sp<android::RefBase>*)&source)) {
+        source->processRTPPacket();
+    }
+}
+
 status_t ARTPConnection::receive(StreamInfo *s, bool receiveRTP) {
     ALOGV("receiving %s", receiveRTP ? "RTP" : "RTCP");
 
@@ -552,37 +621,41 @@ status_t ARTPConnection::receive(StreamInfo *s, bool receiveRTP) {
 
     sp<ABuffer> buffer = new ABuffer(65536);
 
-    struct sockaddr *pRemoteRTCPAddr;
-    int sizeSockSt;
-    if (s->isIPv6) {
-        pRemoteRTCPAddr = (struct sockaddr *)&s->mRemoteRTCPAddr6;
-        sizeSockSt = sizeof(struct sockaddr_in6);
-    } else {
-        pRemoteRTCPAddr = (struct sockaddr *)&s->mRemoteRTCPAddr;
-        sizeSockSt = sizeof(struct sockaddr_in);
-    }
-    socklen_t remoteAddrLen =
-        (!receiveRTP && s->mNumRTCPPacketsReceived == 0)
-            ? sizeSockSt : 0;
+    struct msghdr sMsg = {};
+    struct iovec sIov[1] = {};
 
-    if (mFlags & kViLTEConnection) {
-        remoteAddrLen = 0;
-    }
+    sIov[0].iov_base = (char *) buffer->data();
+    sIov[0].iov_len = buffer->capacity();
+
+    sMsg.msg_iov = sIov;
+    sMsg.msg_iovlen = 1;
+
+    int cMsgSize = sizeof(struct cmsghdr) + sizeof(uint8_t);
+    char buf[CMSG_SPACE(cMsgSize)];
+    sMsg.msg_control = buf;
+    sMsg.msg_controllen = sizeof(buf);
+    sMsg.msg_flags = 0;
 
     ssize_t nbytes;
     do {
-        nbytes = recvfrom(
-            receiveRTP ? s->mRTPSocket : s->mRTCPSocket,
-            buffer->data(),
-            buffer->capacity(),
-            0,
-            remoteAddrLen > 0 ? pRemoteRTCPAddr : NULL,
-            remoteAddrLen > 0 ? &remoteAddrLen : NULL);
+        // Used recvmsg to get the TOS header of incoming packet
+        nbytes = recvmsg(receiveRTP ? s->mRTPSocket : s->mRTCPSocket, &sMsg, 0);
         mCumulativeBytes += nbytes;
     } while (nbytes < 0 && errno == EINTR);
 
     if (nbytes <= 0) {
-        return -ECONNRESET;
+        ALOGW("failed to recv rtp packet. cause=%s", strerror(errno));
+        // ECONNREFUSED may happen in next recvfrom() calling if one of
+        // outgoing packet can not be delivered to remote by using sendto()
+        if (errno == ECONNREFUSED) {
+            return -ECONNREFUSED;
+        } else {
+            return -ECONNRESET;
+        }
+    }
+
+    if (nbytes > 0) {
+        handleIpHeadersIfReceived(s, sMsg);
     }
 
     buffer->setRange(0, nbytes);
@@ -599,13 +672,68 @@ status_t ARTPConnection::receive(StreamInfo *s, bool receiveRTP) {
     return err;
 }
 
+/* This function will check if TOS is present or not in received IP packet.
+ * After that if it is present then it will notify about congestion to upper
+ * layer if CE bit is set in TOS header.
+ **/
+void ARTPConnection::handleIpHeadersIfReceived(StreamInfo *s, struct msghdr sMsg) {
+    struct cmsghdr *cMsg;
+    cMsg = CMSG_FIRSTHDR(&sMsg);
+
+    if (cMsg == NULL) {
+        ALOGV("cmsg is null");
+    }
+
+    for (; cMsg != NULL; cMsg = CMSG_NXTHDR(&sMsg, cMsg)) {
+        bool isTOSHeader = ((cMsg->cmsg_level == (mIsIPv6 ? IPPROTO_IPV6 : IPPROTO_IP))
+                              && (cMsg->cmsg_type == (mIsIPv6 ? IPV6_TCLASS : IP_TOS))
+                              && (cMsg->cmsg_len));
+        if (isTOSHeader) {
+            uint8_t receivedTOS;
+            receivedTOS = *((uint8_t *) CMSG_DATA(cMsg));
+            // checking CE bit is set
+            bool isCEBitMarked = ((receivedTOS & INET_ECN_MASK) == INET_ECN_CE);
+
+            ALOGV("receivedTos(value -> %d)", receivedTOS);
+
+            if (isCEBitMarked) {
+                ALOGD("receivedTos(value -> %d), is ECN CE marked = %d",
+                    receivedTOS, isCEBitMarked);
+                notifyCongestionToUpperLayerIfNeeded(s);
+            }
+            break;
+        }
+    }
+}
+
+/* this function will be use to notify congestion in video call to upper layer */
+void ARTPConnection::notifyCongestionToUpperLayerIfNeeded(StreamInfo *s) {
+    int64_t nowUs = ALooper::GetNowUs();
+
+    if (mLastCongestionNotifyTimeUs <= 0) {
+        mLastCongestionNotifyTimeUs = nowUs;
+    }
+
+    bool isNeedToUpdate = (mLastCongestionNotifyTimeUs + kMinOneSecondNotifyDelayUs <= nowUs);
+    ALOGD("ECN info set by upper layer=%d, isNeedToUpdate=%d", mRtpSockOptEcn, isNeedToUpdate);
+
+    if ((mRtpSockOptEcn != 0) && (isNeedToUpdate)) {
+        sp<AMessage> notify = s->mNotifyMsg->dup();
+        notify->setInt32("rtcp-event", 1);
+        notify->setInt32("payload-type", ARTPSource::RTP_QUALITY_CD);
+        notify->post();
+        mLastCongestionNotifyTimeUs = nowUs;
+        ALOGD("Congestion detected in n/w, Notify upper layer");
+    }
+}
+
 ssize_t ARTPConnection::send(const StreamInfo *info, const sp<ABuffer> buffer) {
         struct sockaddr* pRemoteRTCPAddr;
         int sizeSockSt;
 
         /* It seems this isIPv6 variable is useless.
          * We should remove it to prevent confusion */
-        if (info->isIPv6) {
+        if (mIsIPv6) {
             pRemoteRTCPAddr = (struct sockaddr *)&info->mRemoteRTCPAddr6;
             sizeSockSt = sizeof(struct sockaddr_in6);
         } else {
@@ -626,16 +754,14 @@ ssize_t ARTPConnection::send(const StreamInfo *info, const sp<ABuffer> buffer) {
                     pRemoteRTCPAddr, sizeSockSt);
         } while (n < 0 && errno == EINTR);
 
+        if (n < 0) {
+            ALOGW("failed to send rtcp packet. cause=%s", strerror(errno));
+        }
+
         return n;
 }
 
 status_t ARTPConnection::parseRTP(StreamInfo *s, const sp<ABuffer> &buffer) {
-    if (s->mNumRTPPacketsReceived++ == 0) {
-        sp<AMessage> notify = s->mNotifyMsg->dup();
-        notify->setInt32("first-rtp", true);
-        notify->post();
-    }
-
     size_t size = buffer->size();
 
     if (size < 12) {
@@ -717,8 +843,22 @@ status_t ARTPConnection::parseRTP(StreamInfo *s, const sp<ABuffer> &buffer) {
         meta->setInt32("cvo", cvoDegrees);
     }
 
-    buffer->setInt32Data(u16at(&data[2]));
+    int32_t seq = u16at(&data[2]);
+    buffer->setInt32Data(seq);
     buffer->setRange(payloadOffset, size - payloadOffset);
+
+    if (s->mNumRTPPacketsReceived++ == 0) {
+        sp<AMessage> notify = s->mNotifyMsg->dup();
+        notify->setInt32("first-rtp", true);
+        notify->setInt32("rtcp-event", 1);
+        notify->setInt32("payload-type", ARTPSource::RTP_FIRST_PACKET);
+        notify->setInt32("rtp-time", (int32_t)rtpTime);
+        notify->setInt32("rtp-seq-num", seq);
+        notify->setInt64("recv-time-us", ALooper::GetNowUs());
+        notify->post();
+
+        ALOGD("send first-rtp event to upper layer");
+    }
 
     source->processRTPPacket(buffer);
 
@@ -776,14 +916,12 @@ status_t ARTPConnection::parseRTCP(StreamInfo *s, const sp<ABuffer> &buffer) {
     if (s->mNumRTCPPacketsReceived++ == 0) {
         sp<AMessage> notify = s->mNotifyMsg->dup();
         notify->setInt32("first-rtcp", true);
+        notify->setInt32("rtcp-event", 1);
+        notify->setInt32("payload-type", ARTPSource::RTCP_FIRST_PACKET);
+        notify->setInt64("recv-time-us", ALooper::GetNowUs());
         notify->post();
 
-        ALOGI("send first-rtcp event to upper layer as ImsRxNotice");
-        sp<AMessage> imsNotify = s->mNotifyMsg->dup();
-        imsNotify->setInt32("rtcp-event", 1);
-        imsNotify->setInt32("payload-type", 101);
-        imsNotify->setInt32("feedback-type", 0);
-        imsNotify->post();
+        ALOGD("send first-rtcp event to upper layer");
     }
 
     const uint8_t *data = buffer->data();
@@ -824,11 +962,15 @@ status_t ARTPConnection::parseRTCP(StreamInfo *s, const sp<ABuffer> &buffer) {
         switch (data[1]) {
             case 200:
             {
-                parseSR(s, data, headerLength);
+                parseSenderReport(s, data, headerLength);
                 break;
             }
 
             case 201:  // RR
+            {
+                parseReceiverReport(s, data, headerLength);
+                break;
+            }
             case 202:  // SDES
             case 204:  // APP
                 break;
@@ -880,25 +1022,51 @@ status_t ARTPConnection::parseBYE(
     int64_t nowUs = ALooper::GetNowUs();
     int32_t timeDiff = (nowUs - mLastBitrateReportTimeUs) / 1000000ll;
     int32_t bitrate = mCumulativeBytes * 8 / timeDiff;
-    source->notifyPktInfo(bitrate, true /* isRegular */);
+    source->notifyPktInfo(bitrate, nowUs, true /* isRegular */);
 
     source->byeReceived();
 
     return OK;
 }
 
-status_t ARTPConnection::parseSR(
+status_t ARTPConnection::parseSenderReport(
         StreamInfo *s, const uint8_t *data, size_t size) {
-    size_t RC = data[0] & 0x1f;
-
-    if (size < (7 + RC * 6) * 4) {
-        // Packet too short for the minimal SR header.
+    ALOG_ASSERT(size >= 1, "parseSenderReport: invalid packet size.");
+    size_t receptionReportCount = data[0] & 0x1f;
+    if (size < (7 + (receptionReportCount * 6)) * 4) {
+        // Packet too short for the minimal sender report header.
         return -1;
     }
 
-    uint32_t id = u32at(&data[4]);
+    int64_t recvTimeUs = ALooper::GetNowUs();
+    uint32_t senderId = u32at(&data[4]);
     uint64_t ntpTime = u64at(&data[8]);
     uint32_t rtpTime = u32at(&data[16]);
+    uint32_t pktCount = u32at(&data[20]);
+    uint32_t octCount = u32at(&data[24]);
+
+    ALOGD("SR received: ssrc=0x%08x, rtpTime%u == ntpTime %llu, pkt=%u, oct=%u",
+            senderId, rtpTime, (unsigned long long)ntpTime, pktCount, octCount);
+
+    sp<ARTPSource> source = findSource(s, senderId);
+    source->timeUpdate(recvTimeUs, rtpTime, ntpTime);
+
+    for (int32_t i = 0; i < receptionReportCount; i++) {
+        int32_t offset = 28 + (i * 24);
+        parseReceptionReportBlock(s, recvTimeUs, senderId, data + offset, size - offset);
+    }
+
+    return 0;
+}
+
+status_t ARTPConnection::parseReceiverReport(
+        StreamInfo *s, const uint8_t *data, size_t size) {
+    ALOG_ASSERT(size >= 1, "parseReceiverReport: invalid packet size.");
+    size_t receptionReportCount = data[0] & 0x1f;
+    if (size < (2 + (receptionReportCount * 6)) * 4) {
+        // Packet too short for the minimal receiver report header.
+        return -1;
+    }
 
 #if 0
     ALOGI("XXX timeUpdate: ssrc=0x%08x, rtpTime %u == ntpTime %.3f",
@@ -906,10 +1074,40 @@ status_t ARTPConnection::parseSR(
          rtpTime,
          (ntpTime >> 32) + (double)(ntpTime & 0xffffffff) / (1ll << 32));
 #endif
+    int64_t recvTimeUs = ALooper::GetNowUs();
+    uint32_t senderId = u32at(&data[4]);
 
-    sp<ARTPSource> source = findSource(s, id);
+    for (int i = 0; i < receptionReportCount; i++) {
+        int32_t offset = 8 + (i * 24);
+        parseReceptionReportBlock(s, recvTimeUs, senderId, data + offset, size - offset);
+    }
 
-    source->timeUpdate(rtpTime, ntpTime);
+    return 0;
+}
+
+status_t ARTPConnection::parseReceptionReportBlock(
+        StreamInfo *s, int64_t recvTimeUs, uint32_t senderId, const uint8_t *data, size_t size) {
+    ALOG_ASSERT(size >= 24, "parseReceptionReportBlock: invalid packet size.");
+    if (size < 24) {
+        // remaining size is smaller than reception report block size.
+        return -1;
+    }
+
+    uint32_t rbId = u32at(&data[0]);
+    uint32_t fLost = data[4];
+    int32_t cumLost = u24at(&data[5]);
+    uint32_t ehSeq = u32at(&data[8]);
+    uint32_t jitter = u32at(&data[12]);
+    uint32_t lsr = u32at(&data[16]);
+    uint32_t dlsr = u32at(&data[20]);
+
+    ALOGD("Reception Report Block: t:%llu sid:%u rid:%u fl:%u cl:%u hs:%u jt:%u lsr:%u dlsr:%u",
+            (unsigned long long)recvTimeUs, senderId, rbId, fLost, cumLost,
+            ehSeq, jitter, lsr, dlsr);
+    sp<ARTPSource> source = findSource(s, senderId);
+    sp<ReceptionReportBlock> rrb = new ReceptionReportBlock(
+            rbId, fLost, cumLost, ehSeq, jitter, lsr, dlsr);
+    source->processReceptionReportBlock(recvTimeUs, senderId, rrb);
 
     return 0;
 }
@@ -1062,11 +1260,14 @@ sp<ARTPSource> ARTPConnection::findSource(StreamInfo *info, uint32_t srcId) {
                 srcId, info->mSessionDesc, info->mIndex, info->mNotifyMsg);
 
         if (mFlags & kViLTEConnection) {
+            setStaticJitterTimeMs(50);
             source->setPeriodicFIR(false);
         }
 
         source->setSelfID(mSelfID);
-        source->setJbTime(mJbTimeMs > 0 ? mJbTimeMs : 300);
+        source->setStaticJitterTimeMs(mStaticJitterTimeMs);
+        sp<AMessage> timer = new AMessage(kWhatAlarmStream, this);
+        source->setJbTimer(timer);
         info->mSources.add(srcId, source);
     } else {
         source = info->mSources.valueAt(index);
@@ -1086,12 +1287,20 @@ void ARTPConnection::setSelfID(const uint32_t selfID) {
     mSelfID = selfID;
 }
 
-void ARTPConnection::setJbTime(const uint32_t jbTimeMs) {
-    mJbTimeMs = jbTimeMs;
+void ARTPConnection::setStaticJitterTimeMs(const uint32_t jbTimeMs) {
+    mStaticJitterTimeMs = jbTimeMs;
 }
 
 void ARTPConnection::setTargetBitrate(int32_t targetBitrate) {
     mTargetBitrate = targetBitrate;
+}
+
+void ARTPConnection::setRtpSockOptEcn(int32_t sockOptEcn) {
+    mRtpSockOptEcn = sockOptEcn;
+}
+
+void ARTPConnection::setIsIPv6(const char *localIp) {
+    mIsIPv6 = (strchr(localIp, ':') != nullptr);
 }
 
 void ARTPConnection::checkRxBitrate(int64_t nowUs) {
@@ -1099,7 +1308,7 @@ void ARTPConnection::checkRxBitrate(int64_t nowUs) {
         mCumulativeBytes = 0;
         mLastBitrateReportTimeUs = nowUs;
     }
-    else if (mLastEarlyNotifyTimeUs + 100000ll <= nowUs) {
+    else if (mLastEarlyNotifyTimeUs + kMinOneSecondNotifyDelayUs <= nowUs) {
         int32_t timeDiff = (nowUs - mLastBitrateReportTimeUs) / 1000000ll;
         int32_t bitrate = mCumulativeBytes * 8 / timeDiff;
         mLastEarlyNotifyTimeUs = nowUs;
@@ -1114,7 +1323,7 @@ void ARTPConnection::checkRxBitrate(int64_t nowUs) {
             for (size_t i = 0; i < s->mSources.size(); ++i) {
                 sp<ARTPSource> source = s->mSources.valueAt(i);
                 if (source->isNeedToEarlyNotify()) {
-                    source->notifyPktInfo(bitrate, false /* isRegular */);
+                    source->notifyPktInfo(bitrate, nowUs, false /* isRegular */);
                     mLastEarlyNotifyTimeUs = nowUs + (1000000ll * 3600 * 24); // after 1 day
                 }
             }
@@ -1145,7 +1354,7 @@ void ARTPConnection::checkRxBitrate(int64_t nowUs) {
             buffer->setRange(0, 0);
             for (size_t i = 0; i < s->mSources.size(); ++i) {
                 sp<ARTPSource> source = s->mSources.valueAt(i);
-                source->notifyPktInfo(bitrate, true /* isRegular */);
+                source->notifyPktInfo(bitrate, nowUs, true /* isRegular */);
             }
             ++it;
         }

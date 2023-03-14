@@ -62,6 +62,16 @@
 
 #define ALAC_SPECIFIC_INFO_SIZE (36)
 
+// TODO : Remove the defines once mainline media is built against NDK >= 31.
+// The mp4 extractor is part of mainline and builds against NDK 29 as of
+// writing. These keys are available only from NDK 31:
+#define AMEDIAFORMAT_KEY_MPEGH_PROFILE_LEVEL_INDICATION \
+  "mpegh-profile-level-indication"
+#define AMEDIAFORMAT_KEY_MPEGH_REFERENCE_CHANNEL_LAYOUT \
+  "mpegh-reference-channel-layout"
+#define AMEDIAFORMAT_KEY_MPEGH_COMPATIBLE_SETS \
+  "mpegh-compatible-sets"
+
 namespace android {
 
 enum {
@@ -139,6 +149,7 @@ private:
     bool mIsHEVC;
     bool mIsDolbyVision;
     bool mIsAC4;
+    bool mIsMpegH = false;
     bool mIsPcm;
     size_t mNALLengthSize;
 
@@ -146,6 +157,7 @@ private:
 
     MediaBufferHelper *mBuffer;
 
+    size_t mSrcBufferSize;
     uint8_t *mSrcBuffer;
 
     bool mIsHeif;
@@ -378,6 +390,10 @@ static const char *FourCC2MIME(uint32_t fourcc) {
         case FOURCC(".mp3"):
         case 0x6D730055: // "ms U" mp3 audio
             return MEDIA_MIMETYPE_AUDIO_MPEG;
+        case FOURCC("mha1"):
+            return MEDIA_MIMETYPE_AUDIO_MPEGH_MHA1;
+        case FOURCC("mhm1"):
+            return MEDIA_MIMETYPE_AUDIO_MPEGH_MHM1;
         default:
             ALOGW("Unknown fourcc: %c%c%c%c",
                    (fourcc >> 24) & 0xff,
@@ -1111,13 +1127,15 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
                     void *data;
                     size_t size;
 
-                    if (AMediaFormat_getBuffer(mLastTrack->meta, AMEDIAFORMAT_KEY_CSD_2, &data, &size)) {
+                    if (AMediaFormat_getBuffer(mLastTrack->meta, AMEDIAFORMAT_KEY_CSD_2,
+                                               &data, &size)
+                        && size >= 5) {
                         const uint8_t *ptr = (const uint8_t *)data;
                         const uint8_t profile = ptr[2] >> 1;
-                        const uint8_t bl_compatibility_id = (ptr[4]) >> 4;
+                        const uint8_t blCompatibilityId = (ptr[4]) >> 4;
                         bool create_two_tracks = false;
 
-                        if (bl_compatibility_id && bl_compatibility_id != 15) {
+                        if (blCompatibilityId && blCompatibilityId != 15) {
                             create_two_tracks = true;
                         }
 
@@ -1129,13 +1147,15 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
 
                             track_b->timescale = mLastTrack->timescale;
                             track_b->sampleTable = mLastTrack->sampleTable;
-                            track_b->includes_expensive_metadata = mLastTrack->includes_expensive_metadata;
+                            track_b->includes_expensive_metadata =
+                                mLastTrack->includes_expensive_metadata;
                             track_b->skipTrack = mLastTrack->skipTrack;
                             track_b->elst_needs_processing = mLastTrack->elst_needs_processing;
                             track_b->elst_media_time = mLastTrack->elst_media_time;
                             track_b->elst_segment_duration = mLastTrack->elst_segment_duration;
                             track_b->elst_shift_start_ticks = mLastTrack->elst_shift_start_ticks;
-                            track_b->elst_initial_empty_edit_ticks = mLastTrack->elst_initial_empty_edit_ticks;
+                            track_b->elst_initial_empty_edit_ticks =
+                                mLastTrack->elst_initial_empty_edit_ticks;
                             track_b->subsample_encryption = mLastTrack->subsample_encryption;
 
                             track_b->mTx3gBuffer = mLastTrack->mTx3gBuffer;
@@ -1148,8 +1168,12 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
                             mLastTrack->next = track_b;
                             track_b->next = NULL;
 
-                            auto id = track_b->meta->mFormat->findEntryByName(AMEDIAFORMAT_KEY_CSD_2);
-                            track_b->meta->mFormat->removeEntryAt(id);
+                            // we want to remove the csd-2 key from the metadata, but
+                            // don't have an AMediaFormat_* function to do so. Settle
+                            // for replacing this csd-2 with an empty csd-2.
+                            uint8_t emptybuffer[8] = {};
+                            AMediaFormat_setBuffer(track_b->meta, AMEDIAFORMAT_KEY_CSD_2,
+                                                   emptybuffer, 0);
 
                             if (4 == profile || 7 == profile || 8 == profile ) {
                                 AMediaFormat_setString(track_b->meta,
@@ -1778,6 +1802,8 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
         case FOURCC("fLaC"):
         case FOURCC(".mp3"):
         case 0x6D730055: // "ms U" mp3 audio
+        case FOURCC("mha1"):
+        case FOURCC("mhm1"):
         {
             if (mIsQT && depth >= 1 && mPath[depth - 1] == FOURCC("wave")) {
 
@@ -1977,7 +2003,94 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
             }
             break;
         }
+        case FOURCC("mhaC"):
+        {
+            // See ISO_IEC_23008-3;2019 MHADecoderConfigurationRecord
+            constexpr uint32_t mhac_header_size = 4 /* size */ + 4 /* boxtype 'mhaC' */
+                    + 1 /* configurationVersion */ + 1 /* mpegh3daProfileLevelIndication */
+                    + 1 /* referenceChannelLayout */ + 2 /* mpegh3daConfigLength */;
+            uint8_t mhac_header[mhac_header_size];
+            off64_t data_offset = *offset;
 
+            if (chunk_size < sizeof(mhac_header)) {
+                return ERROR_MALFORMED;
+            }
+
+            if (mDataSource->readAt(data_offset, mhac_header, sizeof(mhac_header))
+                    < (ssize_t)sizeof(mhac_header)) {
+                return ERROR_IO;
+            }
+
+            //get mpegh3daProfileLevelIndication
+            const uint32_t mpegh3daProfileLevelIndication = mhac_header[9];
+            AMediaFormat_setInt32(mLastTrack->meta,
+                    AMEDIAFORMAT_KEY_MPEGH_PROFILE_LEVEL_INDICATION,
+                    mpegh3daProfileLevelIndication);
+
+             //get referenceChannelLayout
+            const uint32_t referenceChannelLayout = mhac_header[10];
+            AMediaFormat_setInt32(mLastTrack->meta,
+                    AMEDIAFORMAT_KEY_MPEGH_REFERENCE_CHANNEL_LAYOUT,
+                    referenceChannelLayout);
+
+            // get mpegh3daConfigLength
+            const uint32_t mhac_config_size = U16_AT(&mhac_header[11]);
+            if (chunk_size != sizeof(mhac_header) + mhac_config_size) {
+                return ERROR_MALFORMED;
+            }
+
+            data_offset += sizeof(mhac_header);
+            uint8_t mhac_config[mhac_config_size];
+            if (mDataSource->readAt(data_offset, mhac_config, sizeof(mhac_config))
+                    < (ssize_t)sizeof(mhac_config)) {
+                return ERROR_IO;
+            }
+
+            AMediaFormat_setBuffer(mLastTrack->meta,
+                    AMEDIAFORMAT_KEY_CSD_0, mhac_config, sizeof(mhac_config));
+            data_offset += sizeof(mhac_config);
+            *offset = data_offset;
+            break;
+        }
+        case FOURCC("mhaP"):
+        {
+            // FDAmd_2 of ISO_IEC_23008-3;2019 MHAProfileAndLevelCompatibilitySetBox
+            constexpr uint32_t mhap_header_size = 4 /* size */ + 4 /* boxtype 'mhaP' */
+                    + 1 /* numCompatibleSets */;
+
+            uint8_t mhap_header[mhap_header_size];
+            off64_t data_offset = *offset;
+
+            if (chunk_size < (ssize_t)mhap_header_size) {
+                return ERROR_MALFORMED;
+            }
+
+            if (mDataSource->readAt(data_offset, mhap_header, sizeof(mhap_header))
+                    < (ssize_t)sizeof(mhap_header)) {
+                return ERROR_IO;
+            }
+
+            // mhap_compatible_sets_size = numCompatibleSets * sizeof(uint8_t)
+            const uint32_t mhap_compatible_sets_size = mhap_header[8];
+            if (chunk_size != sizeof(mhap_header) + mhap_compatible_sets_size) {
+                return ERROR_MALFORMED;
+            }
+
+            data_offset += sizeof(mhap_header);
+            uint8_t mhap_compatible_sets[mhap_compatible_sets_size];
+            if (mDataSource->readAt(
+                    data_offset, mhap_compatible_sets, sizeof(mhap_compatible_sets))
+                            < (ssize_t)sizeof(mhap_compatible_sets)) {
+                return ERROR_IO;
+            }
+
+            AMediaFormat_setBuffer(mLastTrack->meta,
+                    AMEDIAFORMAT_KEY_MPEGH_COMPATIBLE_SETS,
+                    mhap_compatible_sets, sizeof(mhap_compatible_sets));
+            data_offset += sizeof(mhap_compatible_sets);
+            *offset = data_offset;
+            break;
+        }
         case FOURCC("mp4v"):
         case FOURCC("encv"):
         case FOURCC("s263"):
@@ -2480,10 +2593,14 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
             *offset += chunk_size;
             break;
         }
-        case FOURCC("dvcC"):
-        case FOURCC("dvvC"): {
 
-            CHECK_EQ(chunk_data_size, 24);
+        case FOURCC("dvcC"):
+        case FOURCC("dvvC"):
+        case FOURCC("dvwC"):
+        {
+            if (chunk_data_size != 24) {
+                return ERROR_MALFORMED;
+            }
 
             auto buffer = heapbuffer<uint8_t>(chunk_data_size);
 
@@ -2500,13 +2617,14 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
                 return ERROR_MALFORMED;
 
             AMediaFormat_setBuffer(mLastTrack->meta, AMEDIAFORMAT_KEY_CSD_2,
-                                   buffer.get(), chunk_data_size);
+                                    buffer.get(), chunk_data_size);
             AMediaFormat_setString(mLastTrack->meta, AMEDIAFORMAT_KEY_MIME,
                                    MEDIA_MIMETYPE_VIDEO_DOLBY_VISION);
 
             *offset += chunk_size;
             break;
         }
+
         case FOURCC("d263"):
         {
             *offset += chunk_size;
@@ -3367,7 +3485,7 @@ status_t MPEG4Extractor::parseEAC3SpecificBox(off64_t offset) {
         }
         unsigned mask = br.getBits(8);
         for (unsigned i = 0; i < 8; i++) {
-            if (((0x1 << i) && mask) == 0)
+            if (((0x1 << i) & mask) == 0)
                 continue;
 
             if (br.numBitsLeft() < 8) {
@@ -4345,7 +4463,6 @@ MediaTrackHelper *MPEG4Extractor::getTrack(size_t index) {
     if (!AMediaFormat_getString(track->meta, AMEDIAFORMAT_KEY_MIME, &mime)) {
         return NULL;
     }
-
     sp<ItemTable> itemTable;
     if (!strcasecmp(mime, MEDIA_MIMETYPE_VIDEO_AVC)) {
         void *data;
@@ -4378,14 +4495,14 @@ MediaTrackHelper *MPEG4Extractor::getTrack(size_t index) {
     } else if (!strcasecmp(mime, MEDIA_MIMETYPE_VIDEO_DOLBY_VISION)) {
         void *data;
         size_t size;
-        if (!AMediaFormat_getBuffer(track->meta, AMEDIAFORMAT_KEY_CSD_2, &data, &size)) {
+        if (!AMediaFormat_getBuffer(track->meta, AMEDIAFORMAT_KEY_CSD_2, &data, &size)
+                || size != 24) {
             return NULL;
         }
 
         const uint8_t *ptr = (const uint8_t *)data;
-
         // dv_major.dv_minor Should be 1.0 or 2.1
-        if (size != 24 || ((ptr[0] != 1 || ptr[1] != 0) && (ptr[0] != 2 || ptr[1] != 1))) {
+        if ((ptr[0] != 1 || ptr[1] != 0) && (ptr[0] != 2 || ptr[1] != 1)) {
             return NULL;
         }
    } else if (!strcasecmp(mime, MEDIA_MIMETYPE_VIDEO_AV1)
@@ -4658,7 +4775,7 @@ status_t MPEG4Extractor::updateAudioTrackInfoFromESDS_MPEG4Audio(
         if (len2 == 0) {
             return ERROR_MALFORMED;
         }
-        if (offset >= csd_size || csd[offset] != 0x01) {
+        if (offset + len1 > csd_size || csd[offset] != 0x01) {
             return ERROR_MALFORMED;
         }
 
@@ -4971,6 +5088,7 @@ MPEG4Source::MPEG4Source(
       mNALLengthSize(0),
       mStarted(false),
       mBuffer(NULL),
+      mSrcBufferSize(0),
       mSrcBuffer(NULL),
       mItemTable(itemTable),
       mElstShiftStartTicks(elstShiftStartTicks),
@@ -5001,6 +5119,8 @@ MPEG4Source::MPEG4Source(
     bool success = AMediaFormat_getString(mFormat, AMEDIAFORMAT_KEY_MIME, &mime);
     CHECK(success);
 
+    mIsMpegH = !strcasecmp(mime, MEDIA_MIMETYPE_AUDIO_MPEGH_MHA1) ||
+               !strcasecmp(mime, MEDIA_MIMETYPE_AUDIO_MPEGH_MHM1);
     mIsAVC = !strcasecmp(mime, MEDIA_MIMETYPE_VIDEO_AVC);
     mIsHEVC = !strcasecmp(mime, MEDIA_MIMETYPE_VIDEO_HEVC) ||
               !strcasecmp(mime, MEDIA_MIMETYPE_IMAGE_ANDROID_HEIC);
@@ -5150,6 +5270,7 @@ media_status_t MPEG4Source::start() {
         // file probably specified a bad max size
         return AMEDIA_ERROR_MALFORMED;
     }
+    mSrcBufferSize = max_size;
 
     mStarted = true;
 
@@ -5166,6 +5287,7 @@ media_status_t MPEG4Source::stop() {
         mBuffer = NULL;
     }
 
+    mSrcBufferSize = 0;
     delete[] mSrcBuffer;
     mSrcBuffer = NULL;
 
@@ -5775,12 +5897,18 @@ status_t MPEG4Source::parseTrackFragmentRun(off64_t offset, off64_t size) {
             return -EINVAL;
         }
 
-        int32_t dataOffsetDelta;
-        if (!mDataSource->getUInt32(offset, (uint32_t*)&dataOffsetDelta)) {
+        uint32_t dataOffsetDelta;
+        if (!mDataSource->getUInt32(offset, &dataOffsetDelta)) {
             return ERROR_MALFORMED;
         }
 
-        dataOffset = mTrackFragmentHeaderInfo.mBaseDataOffset + dataOffsetDelta;
+        if (__builtin_add_overflow(
+                mTrackFragmentHeaderInfo.mBaseDataOffset, dataOffsetDelta, &dataOffset)) {
+            ALOGW("b/232242894 mBaseDataOffset(%" PRIu64 ") + dataOffsetDelta(%u) overflows uint64",
+                    mTrackFragmentHeaderInfo.mBaseDataOffset, dataOffsetDelta);
+            android_errorWriteLog(0x534e4554, "232242894");
+            return ERROR_MALFORMED;
+        }
 
         offset += 4;
         size -= 4;
@@ -5914,7 +6042,12 @@ status_t MPEG4Source::parseTrackFragmentRun(off64_t offset, off64_t size) {
             return NO_MEMORY;
         }
 
-        dataOffset += sampleSize;
+        if (__builtin_add_overflow(dataOffset, sampleSize, &dataOffset)) {
+            ALOGW("b/232242894 dataOffset(%" PRIu64 ") + sampleSize(%u) overflows uint64",
+                    dataOffset, sampleSize);
+            android_errorWriteLog(0x534e4554, "232242894");
+            return ERROR_MALFORMED;
+        }
     }
 
     mTrackFragmentHeaderInfo.mDataOffset = dataOffset;
@@ -6072,10 +6205,11 @@ media_status_t MPEG4Source::read(
             }
 
             uint32_t syncSampleIndex = sampleIndex;
-            // assume every non-USAC audio sample is a sync sample. This works around
+            // assume every non-USAC/non-MPEGH audio sample is a sync sample.
+            // This works around
             // seek issues with files that were incorrectly written with an
             // empty or single-sample stss block for the audio track
-            if (err == OK && (!mIsAudio || mIsUsac)) {
+            if (err == OK && (!mIsAudio || mIsUsac || mIsMpegH)) {
                 err = mSampleTable->findSyncSampleNear(
                         sampleIndex, &syncSampleIndex, findFlags);
             }
@@ -6352,13 +6486,19 @@ media_status_t MPEG4Source::read(
         // Whole NAL units are returned but each fragment is prefixed by
         // the start code (0x00 00 00 01).
         ssize_t num_bytes_read = 0;
-        num_bytes_read = mDataSource->readAt(offset, mSrcBuffer, size);
+        bool mSrcBufferFitsDataToRead = size <= mSrcBufferSize;
+        if (mSrcBufferFitsDataToRead) {
+          num_bytes_read = mDataSource->readAt(offset, mSrcBuffer, size);
+        } else {
+          // We are trying to read a sample larger than the expected max sample size.
+          // Fall through and let the failure be handled by the following if.
+          android_errorWriteLog(0x534e4554, "188893559");
+        }
 
         if (num_bytes_read < (ssize_t)size) {
             mBuffer->release();
             mBuffer = NULL;
-
-            return AMEDIA_ERROR_IO;
+            return mSrcBufferFitsDataToRead ? AMEDIA_ERROR_IO : AMEDIA_ERROR_MALFORMED;
         }
 
         uint8_t *dstData = (uint8_t *)mBuffer->data();

@@ -45,9 +45,15 @@ class WrappedDecoderInterface : public C2ComponentInterface {
 public:
     WrappedDecoderInterface(
             std::shared_ptr<C2ComponentInterface> intf,
-            std::vector<FilterWrapper::Component> &&filters)
-        : mIntf(intf) {
+            std::vector<FilterWrapper::Component> &&filters,
+            std::weak_ptr<FilterWrapper> filterWrapper)
+        : mIntf(intf), mFilterWrapper(filterWrapper) {
         takeFilters(std::move(filters));
+        for (size_t i = 0; i < mFilters.size(); ++i) {
+            mControlParamTypes.insert(
+                    mFilters[i].desc.controlParams.begin(),
+                    mFilters[i].desc.controlParams.end());
+        }
     }
 
     ~WrappedDecoderInterface() override = default;
@@ -99,6 +105,13 @@ public:
             }
             for (C2Param::Type type : mFilters[i].desc.affectedParams) {
                 mTypeToIndexForQuery[type.type()] = i;
+            }
+        }
+        for (size_t i = mFilters.size(); i > 0; --i) {
+            if (i == 1) {
+                backPropagateParams_l(mIntf, mFilters[0].intf, C2_MAY_BLOCK);
+            } else {
+                backPropagateParams_l(mFilters[i - 2].intf, mFilters[i - 1].intf, C2_MAY_BLOCK);
             }
         }
         if (!mFilters.empty()) {
@@ -179,7 +192,12 @@ public:
         }
 
         std::vector<C2Param *> stackParamsForIntf;
-        std::copy_n(stackParamsList.begin(), stackParamsList.size(), stackParamsForIntf.begin());
+        for (C2Param *param : stackParamsList) {
+            if (mControlParamTypes.count(param->type()) != 0) {
+                continue;
+            }
+            stackParamsForIntf.push_back(param);
+        }
 
         // Gather heap params that did not get queried from the filter interfaces above.
         // These need to be queried from the decoder interface.
@@ -187,6 +205,9 @@ public:
         for (size_t j = 0; j < heapParamIndices.size(); ++j) {
             uint32_t type = heapParamIndices[j].type();
             if (mTypeToIndexForQuery.find(type) != mTypeToIndexForQuery.end()) {
+                continue;
+            }
+            if (mControlParamTypes.count(type) != 0) {
                 continue;
             }
             heapParamIndicesForIntf.push_back(heapParamIndices[j]);
@@ -243,10 +264,13 @@ public:
             std::vector<C2Param *> paramsForFilter;
             for (C2Param* param : params) {
                 auto it = mTypeToIndexForConfig.find(param->type().type());
-                if (it != mTypeToIndexForConfig.end() && it->second != i) {
+                if (it == mTypeToIndexForConfig.end() || it->second != i) {
                     continue;
                 }
                 paramsForFilter.push_back(param);
+            }
+            if (paramsForFilter.empty()) {
+                continue;
             }
             c2_status_t err = filter->config_vb(paramsForFilter, mayBlock, &filterFailures);
             if (err != C2_OK) {
@@ -254,6 +278,13 @@ public:
                         << "WrappedDecoderInterface: " << filter->getName()
                         << " returned error for config_vb; err=" << err;
                 result = err;
+            }
+        }
+        for (size_t i = mFilters.size(); i > 0; --i) {
+            if (i == 1) {
+                backPropagateParams_l(mIntf, mFilters[0].intf, mayBlock);
+            } else {
+                backPropagateParams_l(mFilters[i - 2].intf, mFilters[i - 1].intf, mayBlock);
             }
         }
 
@@ -338,8 +369,10 @@ private:
     mutable std::mutex mMutex;
     std::shared_ptr<C2ComponentInterface> mIntf;
     std::vector<FilterWrapper::Component> mFilters;
+    std::weak_ptr<FilterWrapper> mFilterWrapper;
     std::map<uint32_t, size_t> mTypeToIndexForQuery;
     std::map<uint32_t, size_t> mTypeToIndexForConfig;
+    std::set<C2Param::Type> mControlParamTypes;
 
     c2_status_t transferParams_l(
             const std::shared_ptr<C2ComponentInterface> &curr,
@@ -402,6 +435,45 @@ private:
         }
         return C2_OK;
     }
+
+    c2_status_t backPropagateParams_l(
+            const std::shared_ptr<C2ComponentInterface> &curr,
+            const std::shared_ptr<C2ComponentInterface> &next,
+            c2_blocking_t mayBlock) {
+        // NOTE: this implementation is preliminary --- it could change once
+        // we define what parameters needs to be propagated in component chaining.
+        std::shared_ptr<FilterWrapper> filterWrapper = mFilterWrapper.lock();
+        if (!filterWrapper) {
+            LOG(DEBUG) << "WrappedDecoderInterface: FilterWrapper not found";
+            return C2_OK;
+        }
+        if (!filterWrapper->isFilteringEnabled(next)) {
+            LOG(VERBOSE) << "WrappedDecoderInterface: filtering not enabled";
+            return C2_OK;
+        }
+        std::vector<std::unique_ptr<C2Param>> params;
+        c2_status_t err = filterWrapper->queryParamsForPreviousComponent(next, &params);
+        if (err != C2_OK) {
+            LOG(DEBUG) << "WrappedDecoderInterface: FilterWrapper returned error for "
+                << "queryParamsForPreviousComponent; intf=" << next->getName() << " err=" << err;
+            return C2_OK;
+        }
+        std::vector<C2Param *> configParams;
+        for (size_t i = 0; i < params.size(); ++i) {
+            if (!params[i]) {
+                continue;
+            }
+            configParams.push_back(params[i].get());
+        }
+        std::vector<std::unique_ptr<C2SettingResult>> failures;
+        curr->config_vb(configParams, mayBlock, &failures);
+        if (err != C2_OK && err != C2_BAD_INDEX) {
+            LOG(DEBUG) << "WrappedDecoderInterface: " << next->getName()
+                    << " returned error for config_vb; err=" << err;
+            return err;
+        }
+        return C2_OK;
+    }
 };
 
 class WrappedDecoder : public C2Component, public std::enable_shared_from_this<WrappedDecoder> {
@@ -413,7 +485,7 @@ public:
         : mComp(comp), mFilters(std::move(filters)), mFilterWrapper(filterWrapper) {
         std::vector<FilterWrapper::Component> filtersDup(mFilters);
         mIntf = std::make_shared<WrappedDecoderInterface>(
-                comp->intf(), std::move(filtersDup));
+                comp->intf(), std::move(filtersDup), filterWrapper);
     }
 
     ~WrappedDecoder() override = default;
@@ -543,6 +615,8 @@ public:
             }
         }
         mRunningFilters.clear();
+        std::vector<FilterWrapper::Component> filters(mFilters);
+        mIntf->takeFilters(std::move(filters));
         return result;
     }
 
@@ -844,7 +918,8 @@ std::shared_ptr<C2ComponentInterface> FilterWrapper::maybeWrapInterface(
                 << " is not video/image decoder; not wrapping the interface";
         return intf;
     }
-    return std::make_shared<WrappedDecoderInterface>(intf, createFilters());
+    return std::make_shared<WrappedDecoderInterface>(
+            intf, createFilters(), weak_from_this());
 }
 
 std::shared_ptr<C2Component> FilterWrapper::maybeWrapComponent(
@@ -915,6 +990,16 @@ c2_status_t FilterWrapper::createBlockPool(
         ++it;
     }
     return CreateCodec2BlockPool(allocatorId, component, pool);
+}
+
+c2_status_t FilterWrapper::queryParamsForPreviousComponent(
+        const std::shared_ptr<C2ComponentInterface> &intf,
+        std::vector<std::unique_ptr<C2Param>> *params) {
+    if (mInit != OK) {
+        LOG(WARNING) << "queryParamsForPreviousComponent: Wrapper not initialized: ";
+        return C2_NO_INIT;
+    }
+    return mPlugin->queryParamsForPreviousComponent(intf, params);
 }
 
 }  // namespace android

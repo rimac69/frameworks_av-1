@@ -18,6 +18,9 @@
 #define ATRACE_TAG ATRACE_TAG_CAMERA
 //#define LOG_NDEBUG 0
 
+#include <aidl/android/hardware/camera/device/CameraBlob.h>
+#include <aidl/android/hardware/camera/device/CameraBlobId.h>
+
 #include "api1/client2/JpegProcessor.h"
 #include "common/CameraProviderManager.h"
 #include "utils/SessionConfigurationUtils.h"
@@ -29,6 +32,9 @@
 
 namespace android {
 namespace camera3 {
+
+using aidl::android::hardware::camera::device::CameraBlob;
+using aidl::android::hardware::camera::device::CameraBlobId;
 
 DepthCompositeStream::DepthCompositeStream(sp<CameraDeviceBase> device,
         wp<hardware::camera2::ICameraDeviceCallbacks> cb) :
@@ -42,16 +48,28 @@ DepthCompositeStream::DepthCompositeStream(sp<CameraDeviceBase> device,
         mDepthBufferAcquired(false),
         mBlobBufferAcquired(false),
         mProducerListener(new ProducerListener()),
-        mMaxJpegSize(-1),
+        mMaxJpegBufferSize(-1),
+        mUHRMaxJpegBufferSize(-1),
         mIsLogicalCamera(false) {
     if (device != nullptr) {
         CameraMetadata staticInfo = device->info();
         auto entry = staticInfo.find(ANDROID_JPEG_MAX_SIZE);
         if (entry.count > 0) {
-            mMaxJpegSize = entry.data.i32[0];
+            mMaxJpegBufferSize = entry.data.i32[0];
         } else {
             ALOGW("%s: Maximum jpeg size absent from camera characteristics", __FUNCTION__);
         }
+
+        mUHRMaxJpegSize =
+                SessionConfigurationUtils::getMaxJpegResolution(staticInfo,
+                        /*ultraHighResolution*/true);
+        mDefaultMaxJpegSize =
+                SessionConfigurationUtils::getMaxJpegResolution(staticInfo,
+                        /*isUltraHighResolution*/false);
+
+        mUHRMaxJpegBufferSize =
+            SessionConfigurationUtils::getUHRMaxJpegBufferSize(mUHRMaxJpegSize, mDefaultMaxJpegSize,
+                    mMaxJpegBufferSize);
 
         entry = staticInfo.find(ANDROID_LENS_INTRINSIC_CALIBRATION);
         if (entry.count == 5) {
@@ -243,13 +261,22 @@ status_t DepthCompositeStream::processInputFrame(nsecs_t ts, const InputFrame &i
         jpegSize = inputFrame.jpegBuffer.width;
     }
 
-    size_t maxDepthJpegSize;
-    if (mMaxJpegSize > 0) {
-        maxDepthJpegSize = mMaxJpegSize;
+    size_t maxDepthJpegBufferSize = 0;
+    if (mMaxJpegBufferSize > 0) {
+        // If this is an ultra high resolution sensor and the input frames size
+        // is > default res jpeg.
+        if (mUHRMaxJpegSize.width != 0 &&
+                inputFrame.jpegBuffer.width * inputFrame.jpegBuffer.height >
+                mDefaultMaxJpegSize.width * mDefaultMaxJpegSize.height) {
+            maxDepthJpegBufferSize = mUHRMaxJpegBufferSize;
+        } else {
+            maxDepthJpegBufferSize = mMaxJpegBufferSize;
+        }
     } else {
-        maxDepthJpegSize = std::max<size_t> (jpegSize,
+        maxDepthJpegBufferSize = std::max<size_t> (jpegSize,
                 inputFrame.depthBuffer.width * inputFrame.depthBuffer.height * 3 / 2);
     }
+
     uint8_t jpegQuality = 100;
     auto entry = inputFrame.result.find(ANDROID_JPEG_QUALITY);
     if (entry.count > 0) {
@@ -259,7 +286,7 @@ status_t DepthCompositeStream::processInputFrame(nsecs_t ts, const InputFrame &i
     // The final depth photo will consist of the main jpeg buffer, the depth map buffer (also in
     // jpeg format) and confidence map (jpeg as well). Assume worst case that all 3 jpeg need
     // max jpeg size.
-    size_t finalJpegBufferSize = maxDepthJpegSize * 3;
+    size_t finalJpegBufferSize = maxDepthJpegBufferSize * 3;
 
     if ((res = native_window_set_buffers_dimensions(mOutputSurface.get(), finalJpegBufferSize, 1))
             != OK) {
@@ -276,7 +303,8 @@ status_t DepthCompositeStream::processInputFrame(nsecs_t ts, const InputFrame &i
     }
 
     sp<GraphicBuffer> gb = GraphicBuffer::from(anb);
-    res = gb->lockAsync(GRALLOC_USAGE_SW_WRITE_OFTEN, &dstBuffer, fenceFd);
+    GraphicBufferLocker gbLocker(gb);
+    res = gbLocker.lockAsync(&dstBuffer, fenceFd);
     if (res != OK) {
         ALOGE("%s: Error trying to lock output buffer fence: %s (%d)", __FUNCTION__,
                 strerror(-res), res);
@@ -302,7 +330,7 @@ status_t DepthCompositeStream::processInputFrame(nsecs_t ts, const InputFrame &i
     depthPhoto.mDepthMapStride = inputFrame.depthBuffer.stride;
     depthPhoto.mJpegQuality = jpegQuality;
     depthPhoto.mIsLogical = mIsLogicalCamera;
-    depthPhoto.mMaxJpegSize = maxDepthJpegSize;
+    depthPhoto.mMaxJpegSize = maxDepthJpegBufferSize;
     // The camera intrinsic calibration layout is as follows:
     // [focalLengthX, focalLengthY, opticalCenterX, opticalCenterY, skew]
     if (mIntrinsicCalibration.size() == 5) {
@@ -345,7 +373,7 @@ status_t DepthCompositeStream::processInputFrame(nsecs_t ts, const InputFrame &i
         return res;
     }
 
-    size_t finalJpegSize = actualJpegSize + sizeof(struct camera_jpeg_blob);
+    size_t finalJpegSize = actualJpegSize + sizeof(CameraBlob);
     if (finalJpegSize > finalJpegBufferSize) {
         ALOGE("%s: Final jpeg buffer not large enough for the jpeg blob header", __FUNCTION__);
         outputANW->cancelBuffer(mOutputSurface.get(), anb, /*fence*/ -1);
@@ -361,10 +389,10 @@ status_t DepthCompositeStream::processInputFrame(nsecs_t ts, const InputFrame &i
 
     ALOGV("%s: Final jpeg size: %zu", __func__, finalJpegSize);
     uint8_t* header = static_cast<uint8_t *> (dstBuffer) +
-        (gb->getWidth() - sizeof(struct camera_jpeg_blob));
-    struct camera_jpeg_blob *blob = reinterpret_cast<struct camera_jpeg_blob*> (header);
-    blob->jpeg_blob_id = CAMERA_JPEG_BLOB_ID;
-    blob->jpeg_size = actualJpegSize;
+        (gb->getWidth() - sizeof(CameraBlob));
+    CameraBlob *blob = reinterpret_cast<CameraBlob*> (header);
+    blob->blobId = CameraBlobId::JPEG;
+    blob->blobSizeBytes = actualJpegSize;
     outputANW->queueBuffer(mOutputSurface.get(), anb, /*fence*/ -1);
 
     return res;

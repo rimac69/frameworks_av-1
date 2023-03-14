@@ -35,7 +35,7 @@
 
 namespace android {
 
-using media::permission::Identity;
+using content::AttributionSourceState;
 
 // ----------------------------------------------------------------------------
 // AudioPolicyEffects Implementation
@@ -123,9 +123,10 @@ status_t AudioPolicyEffects::addInputEffects(audio_io_handle_t input,
         Vector <EffectDesc *> effects = mInputSources.valueAt(index)->mEffects;
         for (size_t i = 0; i < effects.size(); i++) {
             EffectDesc *effect = effects[i];
-            Identity identity;
-            identity.packageName = "android";
-            sp<AudioEffect> fx = new AudioEffect(identity);
+            AttributionSourceState attributionSource;
+            attributionSource.packageName = "android";
+            attributionSource.token = sp<BBinder>::make();
+            sp<AudioEffect> fx = new AudioEffect(attributionSource);
             fx->set(NULL, &effect->mUuid, -1, 0, 0, audioSession, input);
             status_t status = fx->initCheck();
             if (status != NO_ERROR && status != ALREADY_EXISTS) {
@@ -274,9 +275,10 @@ status_t AudioPolicyEffects::addOutputSessionEffects(audio_io_handle_t output,
         Vector <EffectDesc *> effects = mOutputStreams.valueAt(index)->mEffects;
         for (size_t i = 0; i < effects.size(); i++) {
             EffectDesc *effect = effects[i];
-            Identity identity;
-            identity.packageName = "android";
-            sp<AudioEffect> fx = new AudioEffect(identity);
+            AttributionSourceState attributionSource;
+            attributionSource.packageName = "android";
+            attributionSource.token = sp<BBinder>::make();
+            sp<AudioEffect> fx = new AudioEffect(attributionSource);
             fx->set(NULL, &effect->mUuid, 0, 0, 0, audioSession, output);
             status_t status = fx->initCheck();
             if (status != NO_ERROR && status != ALREADY_EXISTS) {
@@ -343,7 +345,8 @@ status_t AudioPolicyEffects::addSourceDefaultEffect(const effect_uuid_t *type,
             (source > AUDIO_SOURCE_MAX &&
              source != AUDIO_SOURCE_HOTWORD &&
              source != AUDIO_SOURCE_FM_TUNER &&
-             source != AUDIO_SOURCE_ECHO_REFERENCE)) {
+             source != AUDIO_SOURCE_ECHO_REFERENCE &&
+             source != AUDIO_SOURCE_ULTRASOUND)) {
         ALOGE("addSourceDefaultEffect(): Unsupported source type %d", source);
         return BAD_VALUE;
     }
@@ -384,7 +387,7 @@ status_t AudioPolicyEffects::addSourceDefaultEffect(const effect_uuid_t *type,
         return res;
     }
     EffectDesc *effect = new EffectDesc(
-            descriptor.name, *type, opPackageName, *uuid, priority, *id);
+            descriptor.name, descriptor.type, opPackageName, descriptor.uuid, priority, *id);
     desc->mEffects.add(effect);
     // TODO(b/71813697): Support setting params as well.
 
@@ -449,7 +452,7 @@ status_t AudioPolicyEffects::addStreamDefaultEffect(const effect_uuid_t *type,
         return res;
     }
     EffectDesc *effect = new EffectDesc(
-            descriptor.name, *type, opPackageName, *uuid, priority, *id);
+            descriptor.name, descriptor.type, opPackageName, descriptor.uuid, priority, *id);
     desc->mEffects.add(effect);
     // TODO(b/71813697): Support setting params as well.
 
@@ -542,6 +545,7 @@ void AudioPolicyEffects::EffectVector::setProcessorEnabled(bool enabled)
     CAMCORDER_SRC_TAG,
     VOICE_REC_SRC_TAG,
     VOICE_COMM_SRC_TAG,
+    REMOTE_SUBMIX_SRC_TAG,
     UNPROCESSED_SRC_TAG,
     VOICE_PERFORMANCE_SRC_TAG
 };
@@ -976,9 +980,10 @@ void AudioPolicyEffects::initDefaultDeviceEffects()
     for (const auto& deviceEffectsIter : mDeviceEffects) {
         const auto& deviceEffects =  deviceEffectsIter.second;
         for (const auto& effectDesc : deviceEffects->mEffectDescriptors->mEffects) {
-            Identity identity;
-            identity.packageName = "android";
-            sp<AudioEffect> fx = new AudioEffect(identity);
+            AttributionSourceState attributionSource;
+            attributionSource.packageName = "android";
+            attributionSource.token = sp<BBinder>::make();
+            sp<AudioEffect> fx = new AudioEffect(attributionSource);
             fx->set(EFFECT_UUID_NULL, &effectDesc->mUuid, 0, nullptr,
                     nullptr, AUDIO_SESSION_DEVICE, AUDIO_IO_HANDLE_NONE,
                     AudioDeviceTypeAddr{deviceEffects->getDeviceType(),

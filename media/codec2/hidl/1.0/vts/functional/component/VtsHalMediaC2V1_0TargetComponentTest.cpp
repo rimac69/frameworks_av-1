@@ -54,13 +54,14 @@
 
 namespace {
 using InputTestParameters = std::tuple<std::string, std::string, uint32_t, bool>;
-static std::vector<InputTestParameters> kInputTestParameters;
+static std::vector<InputTestParameters> gInputTestParameters;
 
 // google.codec2 Component test setup
 class Codec2ComponentHidlTestBase : public ::testing::Test {
   public:
     virtual void SetUp() override {
         getParams();
+        mDisableTest = false;
         mEos = false;
         mClient = android::Codec2Client::CreateFromService(mInstanceName.c_str());
         ASSERT_NE(mClient, nullptr);
@@ -73,6 +74,14 @@ class Codec2ComponentHidlTestBase : public ::testing::Test {
         for (int i = 0; i < MAX_INPUT_BUFFERS; ++i) {
             mWorkQueue.emplace_back(new C2Work);
         }
+
+        C2SecureModeTuning secureModeTuning{};
+        mComponent->query({&secureModeTuning}, {}, C2_MAY_BLOCK, nullptr);
+        if (secureModeTuning.value != C2Config::SM_UNPROTECTED) {
+            mDisableTest = true;
+        }
+
+        if (mDisableTest) std::cout << "[   WARN   ] Test Disabled \n";
     }
 
     virtual void TearDown() override {
@@ -105,6 +114,7 @@ class Codec2ComponentHidlTestBase : public ::testing::Test {
     std::string mInstanceName;
     std::string mComponentName;
     bool mEos;
+    bool mDisableTest;
     std::mutex mQueueLock;
     std::condition_variable mQueueCondition;
     std::list<std::unique_ptr<C2Work>> mWorkQueue;
@@ -324,6 +334,7 @@ class Codec2ComponentInputTests : public Codec2ComponentHidlTestBase,
 };
 
 TEST_P(Codec2ComponentInputTests, InputBufferTest) {
+    if (mDisableTest) GTEST_SKIP() << "Test is disabled";
     description("Tests for different inputs");
 
     uint32_t flags = std::get<2>(GetParam());
@@ -345,28 +356,28 @@ TEST_P(Codec2ComponentInputTests, InputBufferTest) {
     ASSERT_EQ(mComponent->reset(), C2_OK);
 }
 
-INSTANTIATE_TEST_SUITE_P(PerInstance, Codec2ComponentHidlTest, testing::ValuesIn(kTestParameters),
+INSTANTIATE_TEST_SUITE_P(PerInstance, Codec2ComponentHidlTest, testing::ValuesIn(gTestParameters),
                          PrintInstanceTupleNameToString<>);
 
 INSTANTIATE_TEST_CASE_P(NonStdInputs, Codec2ComponentInputTests,
-                        testing::ValuesIn(kInputTestParameters), PrintInstanceTupleNameToString<>);
+                        testing::ValuesIn(gInputTestParameters), PrintInstanceTupleNameToString<>);
 }  // anonymous namespace
 
 // TODO: Add test for Invalid work,
 // TODO: Add test for Invalid states
 int main(int argc, char** argv) {
     parseArgs(argc, argv);
-    kTestParameters = getTestParameters();
-    for (auto params : kTestParameters) {
-        kInputTestParameters.push_back(
+    gTestParameters = getTestParameters();
+    for (auto params : gTestParameters) {
+        gInputTestParameters.push_back(
                 std::make_tuple(std::get<0>(params), std::get<1>(params), 0, true));
-        kInputTestParameters.push_back(std::make_tuple(std::get<0>(params), std::get<1>(params),
+        gInputTestParameters.push_back(std::make_tuple(std::get<0>(params), std::get<1>(params),
                                                        C2FrameData::FLAG_END_OF_STREAM, true));
-        kInputTestParameters.push_back(
+        gInputTestParameters.push_back(
                 std::make_tuple(std::get<0>(params), std::get<1>(params), 0, false));
-        kInputTestParameters.push_back(std::make_tuple(std::get<0>(params), std::get<1>(params),
+        gInputTestParameters.push_back(std::make_tuple(std::get<0>(params), std::get<1>(params),
                                                        C2FrameData::FLAG_CODEC_CONFIG, false));
-        kInputTestParameters.push_back(std::make_tuple(std::get<0>(params), std::get<1>(params),
+        gInputTestParameters.push_back(std::make_tuple(std::get<0>(params), std::get<1>(params),
                                                        C2FrameData::FLAG_END_OF_STREAM, false));
     }
 

@@ -43,6 +43,10 @@ license {
     ],
 }
 
+cc_library_headers {
+    name: "camera_headers",
+    export_include_dirs: ["include"],
+}
 cc_library_shared {
     name: "libcamera_client",
 
@@ -89,6 +93,7 @@ cc_library_shared {
         "libgui",
         "libcamera_metadata",
         "libnativewindow",
+        "lib-platform-compat-native-api",
     ],
 
     include_dirs: [
@@ -109,6 +114,30 @@ cc_library_shared {
 
 }
 
+cc_library_host_static {
+    name: "libcamera_client_host",
+
+    srcs: [
+        "CameraMetadata.cpp",
+        "VendorTagDescriptor.cpp",
+    ],
+
+    shared_libs: [
+        "libbase",
+        "libcamera_metadata",
+    ],
+
+    include_dirs: [
+        "system/media/private/camera/include",
+        "frameworks/native/include/media/openmax",
+    ],
+
+    export_include_dirs: [
+        "include",
+        "include/camera"
+    ],
+}
+
 // AIDL interface between camera clients and the camera service.
 filegroup {
     name: "libcamera_client_aidl",
@@ -119,6 +148,8 @@ filegroup {
         "aidl/android/hardware/camera2/ICameraDeviceCallbacks.aidl",
         "aidl/android/hardware/camera2/ICameraDeviceUser.aidl",
         "aidl/android/hardware/camera2/ICameraOfflineSession.aidl",
+        "aidl/android/hardware/camera2/ICameraInjectionCallback.aidl",
+        "aidl/android/hardware/camera2/ICameraInjectionSession.aidl",
     ],
     path: "aidl",
 }

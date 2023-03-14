@@ -26,12 +26,13 @@
 #include <media/AudioRecord.h>
 #include <utils/String16.h>
 
+#include "core/AudioGlobal.h"
 #include "legacy/AudioStreamLegacy.h"
 #include "legacy/AudioStreamRecord.h"
 #include "utility/AudioClock.h"
 #include "utility/FixedBlockWriter.h"
 
-using android::media::permission::Identity;
+using android::content::AttributionSourceState;
 
 using namespace android;
 using namespace aaudio;
@@ -64,11 +65,8 @@ aaudio_result_t AudioStreamRecord::open(const AudioStreamBuilder& builder)
     const audio_session_t sessionId = AAudioConvert_aaudioToAndroidSessionId(requestedSessionId);
 
     // TODO Support UNSPECIFIED in AudioRecord. For now, use stereo if unspecified.
-    int32_t samplesPerFrame = (getSamplesPerFrame() == AAUDIO_UNSPECIFIED)
-                              ? 2 : getSamplesPerFrame();
-    audio_channel_mask_t channelMask = samplesPerFrame <= 2 ?
-                               audio_channel_in_mask_from_count(samplesPerFrame) :
-                               audio_channel_mask_for_index_assignment_from_count(samplesPerFrame);
+    audio_channel_mask_t channelMask =
+            AAudio_getChannelMaskForOpen(getChannelMask(), getSamplesPerFrame(), true /*isInput*/);
 
     size_t frameCount = (builder.getBufferCapacity() == AAUDIO_UNSPECIFIED) ? 0
                         : builder.getBufferCapacity();
@@ -92,46 +90,24 @@ aaudio_result_t AudioStreamRecord::open(const AudioStreamBuilder& builder)
             break;
     }
 
+    const audio_format_t requestedFormat = getFormat();
     // Preserve behavior of API 26
-    if (getFormat() == AUDIO_FORMAT_DEFAULT) {
+    if (requestedFormat == AUDIO_FORMAT_DEFAULT) {
         setFormat(AUDIO_FORMAT_PCM_FLOAT);
     }
 
-    // Maybe change device format to get a FAST path.
-    // AudioRecord does not support FAST mode for FLOAT data.
-    // TODO AudioRecord should allow FLOAT data paths for FAST tracks.
-    // So IF the user asks for low latency FLOAT
-    // AND the sampleRate is likely to be compatible with FAST
-    // THEN request I16 and convert to FLOAT when passing to user.
-    // Note that hard coding 48000 Hz is not ideal because the sampleRate
-    // for a FAST path might not be 48000 Hz.
-    // It normally is but there is a chance that it is not.
-    // And there is no reliable way to know that in advance.
-    // Luckily the consequences of a wrong guess are minor.
-    // We just may not get a FAST track.
-    // But we wouldn't have anyway without this hack.
-    constexpr int32_t kMostLikelySampleRateForFast = 48000;
-    if (getFormat() == AUDIO_FORMAT_PCM_FLOAT
-            && perfMode == AAUDIO_PERFORMANCE_MODE_LOW_LATENCY
-            && (samplesPerFrame <= 2) // FAST only for mono and stereo
-            && (getSampleRate() == kMostLikelySampleRateForFast
-                || getSampleRate() == AAUDIO_UNSPECIFIED)) {
-        setDeviceFormat(AUDIO_FORMAT_PCM_16_BIT);
-    } else {
-        setDeviceFormat(getFormat());
-    }
+
+    setDeviceFormat(getFormat());
 
     // To avoid glitching, let AudioFlinger pick the optimal burst size.
     uint32_t notificationFrames = 0;
 
     // Setup the callback if there is one.
-    AudioRecord::callback_t callback = nullptr;
-    void *callbackData = nullptr;
+    sp<AudioRecord::IAudioRecordCallback> callback;
     AudioRecord::transfer_type streamTransferType = AudioRecord::transfer_type::TRANSFER_SYNC;
     if (builder.getDataCallbackProc() != nullptr) {
         streamTransferType = AudioRecord::transfer_type::TRANSFER_CALLBACK;
-        callback = getLegacyCallback();
-        callbackData = this;
+        callback = sp<AudioRecord::IAudioRecordCallback>::fromExisting(this);
     }
     mCallbackBufferSize = builder.getFramesPerDataCallback();
 
@@ -155,12 +131,13 @@ aaudio_result_t AudioStreamRecord::open(const AudioStreamBuilder& builder)
             .tags = ""
     };
 
-    // TODO b/182392769: use identity util
-    Identity identity;
-    identity.uid = VALUE_OR_FATAL(legacy2aidl_uid_t_int32_t(getuid()));
-    identity.pid = VALUE_OR_FATAL(legacy2aidl_pid_t_int32_t(getpid()));
-    identity.packageName = builder.getOpPackageName();
-    identity.attributionTag = builder.getAttributionTag();
+    // TODO b/182392769: use attribution source util
+    AttributionSourceState attributionSource;
+    attributionSource.uid = VALUE_OR_FATAL(legacy2aidl_uid_t_int32_t(getuid()));
+    attributionSource.pid = VALUE_OR_FATAL(legacy2aidl_pid_t_int32_t(getpid()));
+    attributionSource.packageName = builder.getOpPackageName();
+    attributionSource.attributionTag = builder.getAttributionTag();
+    attributionSource.token = sp<BBinder>::make();
 
     // ----------- open the AudioRecord ---------------------
     // Might retry, but never more than once.
@@ -168,7 +145,7 @@ aaudio_result_t AudioStreamRecord::open(const AudioStreamBuilder& builder)
         const audio_format_t requestedInternalFormat = getDeviceFormat();
 
         mAudioRecord = new AudioRecord(
-                identity
+                attributionSource
         );
         mAudioRecord->set(
                 AUDIO_SOURCE_DEFAULT, // ignored because we pass attributes below
@@ -177,7 +154,6 @@ aaudio_result_t AudioStreamRecord::open(const AudioStreamBuilder& builder)
                 channelMask,
                 frameCount,
                 callback,
-                callbackData,
                 notificationFrames,
                 false /*threadCanCallJava*/,
                 sessionId,
@@ -217,9 +193,17 @@ aaudio_result_t AudioStreamRecord::open(const AudioStreamBuilder& builder)
 
     mMetricsId = std::string(AMEDIAMETRICS_KEY_PREFIX_AUDIO_RECORD)
             + std::to_string(mAudioRecord->getPortId());
+    android::mediametrics::LogItem(mMetricsId)
+            .set(AMEDIAMETRICS_PROP_PERFORMANCEMODE,
+                 AudioGlobal_convertPerformanceModeToText(builder.getPerformanceMode()))
+            .set(AMEDIAMETRICS_PROP_SHARINGMODE,
+                 AudioGlobal_convertSharingModeToText(builder.getSharingMode()))
+            .set(AMEDIAMETRICS_PROP_ENCODINGCLIENT, toString(requestedFormat).c_str()).record();
 
     // Get the actual values from the AudioRecord.
-    setSamplesPerFrame(mAudioRecord->channelCount());
+    setChannelMask(AAudioConvert_androidToAAudioChannelMask(
+            mAudioRecord->channelMask(), true /*isInput*/,
+            AAudio_isChannelIndexMask(getChannelMask())));
     setSampleRate(mAudioRecord->getSampleRate());
     setBufferCapacity(getBufferCapacityFromDevice());
     setFramesPerBurst(getFramesPerBurstFromDevice());
@@ -340,23 +324,6 @@ const void * AudioStreamRecord::maybeConvertDeviceData(const void *audioData, in
     } else {
         return audioData;
     }
-}
-
-void AudioStreamRecord::processCallback(int event, void *info) {
-    switch (event) {
-        case AudioRecord::EVENT_MORE_DATA:
-            processCallbackCommon(AAUDIO_CALLBACK_OPERATION_PROCESS_DATA, info);
-            break;
-
-            // Stream got rerouted so we disconnect.
-        case AudioRecord::EVENT_NEW_IAUDIORECORD:
-            processCallbackCommon(AAUDIO_CALLBACK_OPERATION_DISCONNECTED, info);
-            break;
-
-        default:
-            break;
-    }
-    return;
 }
 
 aaudio_result_t AudioStreamRecord::requestStart_l()
@@ -496,7 +463,7 @@ aaudio_result_t AudioStreamRecord::read(void *buffer,
     return (aaudio_result_t) framesRead;
 }
 
-aaudio_result_t AudioStreamRecord::setBufferSize(int32_t requestedFrames)
+aaudio_result_t AudioStreamRecord::setBufferSize(int32_t /*requestedFrames*/)
 {
     return getBufferSize();
 }
@@ -544,7 +511,7 @@ int64_t AudioStreamRecord::getFramesWritten() {
         case AAUDIO_STREAM_STATE_STARTED:
             result = mAudioRecord->getPosition(&position);
             if (result == OK) {
-                mFramesWritten.update32(position);
+                mFramesWritten.update32((int32_t)position);
             }
             break;
         case AAUDIO_STREAM_STATE_STOPPING:

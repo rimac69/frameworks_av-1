@@ -35,7 +35,7 @@ cc_library {
         "android.hardware.media.c2@1.0",
         "android.hardware.media.omx@1.0",
         "av-types-aidl-cpp",
-        "media_permission-aidl-cpp",
+        "framework-permission-aidl-cpp",
         "libaudioclient_aidl_conversion",
         "libbase",
         "libactivitymanager_aidl",
@@ -65,10 +65,14 @@ cc_library {
         "libstagefright_foundation",
         "libstagefright_httplive",
         "libutils",
+        "packagemanager_aidl-cpp",
     ],
 
     header_libs: [
         "media_plugin_headers",
+        "libmediautils_headers",
+        "libstagefright_rtsp_headers",
+        "libstagefright_webm_headers",
     ],
 
     static_libs: [
@@ -76,20 +80,23 @@ cc_library {
         "libstagefright_nuplayer",
         "libstagefright_rtsp",
         "libstagefright_timedtext",
-        "media_permission-aidl-cpp",
+        "framework-permission-aidl-cpp",
     ],
 
     export_shared_lib_headers: [
         "libmedia",
-        "media_permission-aidl-cpp",
+        "framework-permission-aidl-cpp",
     ],
 
-    include_dirs: [
-        "frameworks/av/media/libstagefright/rtsp",
-        "frameworks/av/media/libstagefright/webm",
+    export_header_lib_headers: [
+        "libmediautils_headers",
     ],
 
     local_include_dirs: ["include"],
+
+    export_include_dirs: [
+        ".",
+    ],
 
     cflags: [
         "-Werror",

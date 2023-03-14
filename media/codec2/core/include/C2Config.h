@@ -59,6 +59,8 @@ struct C2Config {
     enum drc_compression_mode_t : int32_t;  ///< DRC compression mode
     enum drc_effect_type_t : int32_t;       ///< DRC effect type
     enum drc_album_mode_t : int32_t;        ///< DRC album mode
+    enum hdr_dynamic_metadata_type_t : uint32_t;  ///< HDR dynamic metadata type
+    enum hdr_format_t : uint32_t;           ///< HDR format
     enum intra_refresh_mode_t : uint32_t;   ///< intra refresh modes
     enum level_t : uint32_t;                ///< coding level
     enum ordinal_key_t : uint32_t;          ///< work ordering keys
@@ -73,6 +75,11 @@ struct C2Config {
     enum secure_mode_t : uint32_t;          ///< secure/protected modes
     enum supplemental_info_t : uint32_t;    ///< supplemental information types
     enum tiling_mode_t : uint32_t;          ///< tiling modes
+};
+
+struct C2PlatformConfig {
+    enum encoding_quality_level_t : uint32_t; ///< encoding quality level
+    enum tunnel_peek_mode_t: uint32_t;      ///< tunnel peek mode
 };
 
 namespace {
@@ -185,9 +192,11 @@ enum C2ParamIndexKind : C2Param::type_index_t {
 
     kParamIndexPictureTypeMask,
     kParamIndexPictureType,
+    // deprecated
     kParamIndexHdr10PlusMetadata,
-
     kParamIndexPictureQuantization,
+    kParamIndexHdrDynamicMetadata,
+    kParamIndexHdrFormat,
 
     /* ------------------------------------ video components ------------------------------------ */
 
@@ -258,8 +267,23 @@ enum C2ParamIndexKind : C2Param::type_index_t {
     kParamIndexTunneledMode, // struct
     kParamIndexTunnelHandle, // int32[]
     kParamIndexTunnelSystemTime, // int64
+    kParamIndexTunnelHoldRender, // bool
+    kParamIndexTunnelStartRender, // bool
 
+    // dmabuf allocator
     kParamIndexStoreDmaBufUsage,  // store, struct
+
+    // encoding quality requirements
+    kParamIndexEncodingQualityLevel, // encoders, enum
+
+    // encoding statistics, average block qp of a frame
+    kParamIndexAverageBlockQuantization, // int32
+
+    // channel mask for decoded audio
+    kParamIndexAndroidChannelMask, // uint32
+
+    // allow tunnel peek behavior to be unspecified for app compatibility
+    kParamIndexTunnelPeekMode, // tunnel mode, enum
 };
 
 }
@@ -384,6 +408,7 @@ constexpr char C2_PARAMKEY_TIME_STRETCH[]  = "algo.time-stretch";
 
 namespace {
 
+// Codec bases are ordered by their date of introduction to the code base.
 enum : uint32_t {
     _C2_PL_MP2V_BASE = 0x1000,
     _C2_PL_AAC_BASE  = 0x2000,
@@ -394,12 +419,16 @@ enum : uint32_t {
     _C2_PL_VP9_BASE  = 0x7000,
     _C2_PL_DV_BASE   = 0x8000,
     _C2_PL_AV1_BASE  = 0x9000,
+    _C2_PL_VP8_BASE  = 0xA000,
+    _C2_PL_MPEGH_BASE = 0xB000,     // MPEG-H 3D Audio
 
     C2_PROFILE_LEVEL_VENDOR_START = 0x70000000,
 };
 
 }
 
+// Profiles and levels for each codec are ordered based on how they are ordered in the
+// corresponding standard documents at introduction, and chronologically afterwards.
 enum C2Config::profile_t : uint32_t {
     PROFILE_UNUSED = 0,                         ///< profile is not used by this media type
 
@@ -547,6 +576,18 @@ enum C2Config::profile_t : uint32_t {
     PROFILE_AV1_0 = _C2_PL_AV1_BASE,            ///< AV1 Profile 0 (4:2:0, 8 to 10 bit)
     PROFILE_AV1_1,                              ///< AV1 Profile 1 (8 to 10 bit)
     PROFILE_AV1_2,                              ///< AV1 Profile 2 (8 to 12 bit)
+
+    // VP8 profiles
+    PROFILE_VP8_0 = _C2_PL_VP8_BASE,            ///< VP8 Profile 0
+    PROFILE_VP8_1,                              ///< VP8 Profile 1
+    PROFILE_VP8_2,                              ///< VP8 Profile 2
+    PROFILE_VP8_3,                              ///< VP8 Profile 3
+
+    // MPEG-H 3D Audio profiles
+    PROFILE_MPEGH_MAIN = _C2_PL_MPEGH_BASE,     ///< MPEG-H Main
+    PROFILE_MPEGH_HIGH,                         ///< MPEG-H High
+    PROFILE_MPEGH_LC,                           ///< MPEG-H Low-complexity
+    PROFILE_MPEGH_BASELINE,                     ///< MPEG-H Baseline
 };
 
 enum C2Config::level_t : uint32_t {
@@ -653,6 +694,9 @@ enum C2Config::level_t : uint32_t {
     LEVEL_DV_MAIN_UHD_30,                       ///< Dolby Vision main tier uhd30
     LEVEL_DV_MAIN_UHD_48,                       ///< Dolby Vision main tier uhd48
     LEVEL_DV_MAIN_UHD_60,                       ///< Dolby Vision main tier uhd60
+    LEVEL_DV_MAIN_UHD_120,                      ///< Dolby Vision main tier uhd120
+    LEVEL_DV_MAIN_8K_30,                        ///< Dolby Vision main tier 8k30
+    LEVEL_DV_MAIN_8K_60,                        ///< Dolby Vision main tier 8k60
 
     LEVEL_DV_HIGH_HD_24 = _C2_PL_DV_BASE + 0x100,  ///< Dolby Vision high tier hd24
     LEVEL_DV_HIGH_HD_30,                        ///< Dolby Vision high tier hd30
@@ -663,6 +707,9 @@ enum C2Config::level_t : uint32_t {
     LEVEL_DV_HIGH_UHD_30,                       ///< Dolby Vision high tier uhd30
     LEVEL_DV_HIGH_UHD_48,                       ///< Dolby Vision high tier uhd48
     LEVEL_DV_HIGH_UHD_60,                       ///< Dolby Vision high tier uhd60
+    LEVEL_DV_HIGH_UHD_120,                      ///< Dolby Vision high tier uhd120
+    LEVEL_DV_HIGH_8K_30,                        ///< Dolby Vision high tier 8k30
+    LEVEL_DV_HIGH_8K_60,                        ///< Dolby Vision high tier 8k60
 
     // AV1 levels
     LEVEL_AV1_2    = _C2_PL_AV1_BASE ,          ///< AV1 Level 2
@@ -689,6 +736,13 @@ enum C2Config::level_t : uint32_t {
     LEVEL_AV1_7_1,                              ///< AV1 Level 7.1
     LEVEL_AV1_7_2,                              ///< AV1 Level 7.2
     LEVEL_AV1_7_3,                              ///< AV1 Level 7.3
+
+    // MPEG-H 3D Audio levels
+    LEVEL_MPEGH_1 = _C2_PL_MPEGH_BASE,          ///< MPEG-H L1
+    LEVEL_MPEGH_2,                              ///< MPEG-H L2
+    LEVEL_MPEGH_3,                              ///< MPEG-H L3
+    LEVEL_MPEGH_4,                              ///< MPEG-H L4
+    LEVEL_MPEGH_5,                              ///< MPEG-H L5
 };
 
 struct C2ProfileLevelStruct {
@@ -1568,16 +1622,82 @@ struct C2HdrStaticMetadataStruct {
     C2FIELD(maxFall, "max-fall")
 };
 typedef C2StreamParam<C2Info, C2HdrStaticMetadataStruct, kParamIndexHdrStaticMetadata>
-        C2StreamHdrStaticInfo;
+        C2StreamHdrStaticMetadataInfo;
+typedef C2StreamParam<C2Info, C2HdrStaticMetadataStruct, kParamIndexHdrStaticMetadata>
+        C2StreamHdrStaticInfo;  // deprecated
 constexpr char C2_PARAMKEY_HDR_STATIC_INFO[] = "raw.hdr-static-info";
 
 /**
  * HDR10+ Metadata Info.
+ *
+ * Deprecated. Use C2StreamHdrDynamicMetadataInfo with
+ * HDR_DYNAMIC_METADATA_TYPE_SMPTE_2094_40
  */
 typedef C2StreamParam<C2Info, C2BlobValue, kParamIndexHdr10PlusMetadata>
-        C2StreamHdr10PlusInfo;
-constexpr char C2_PARAMKEY_INPUT_HDR10_PLUS_INFO[] = "input.hdr10-plus-info";
-constexpr char C2_PARAMKEY_OUTPUT_HDR10_PLUS_INFO[] = "output.hdr10-plus-info";
+        C2StreamHdr10PlusInfo;  // deprecated
+constexpr char C2_PARAMKEY_INPUT_HDR10_PLUS_INFO[] = "input.hdr10-plus-info";  // deprecated
+constexpr char C2_PARAMKEY_OUTPUT_HDR10_PLUS_INFO[] = "output.hdr10-plus-info";  // deprecated
+
+/**
+ * HDR dynamic metadata types
+ */
+C2ENUM(C2Config::hdr_dynamic_metadata_type_t, uint32_t,
+    HDR_DYNAMIC_METADATA_TYPE_SMPTE_2094_10,  ///< SMPTE ST 2094-10
+    HDR_DYNAMIC_METADATA_TYPE_SMPTE_2094_40,  ///< SMPTE ST 2094-40
+)
+
+struct C2HdrDynamicMetadataStruct {
+    inline C2HdrDynamicMetadataStruct() { memset(this, 0, sizeof(*this)); }
+
+    inline C2HdrDynamicMetadataStruct(
+            size_t flexCount, C2Config::hdr_dynamic_metadata_type_t type)
+        : type_(type) {
+        memset(data, 0, flexCount);
+    }
+
+    C2Config::hdr_dynamic_metadata_type_t type_;
+    uint8_t data[];
+
+    DEFINE_AND_DESCRIBE_FLEX_C2STRUCT(HdrDynamicMetadata, data)
+    C2FIELD(type_, "type")
+    C2FIELD(data, "data")
+};
+
+/**
+ * Dynamic HDR Metadata Info.
+ */
+typedef C2StreamParam<C2Info, C2HdrDynamicMetadataStruct, kParamIndexHdrDynamicMetadata>
+        C2StreamHdrDynamicMetadataInfo;
+constexpr char C2_PARAMKEY_INPUT_HDR_DYNAMIC_INFO[] = "input.hdr-dynamic-info";
+constexpr char C2_PARAMKEY_OUTPUT_HDR_DYNAMIC_INFO[] = "output.hdr-dynamic-info";
+
+/**
+ * HDR Format
+ */
+C2ENUM(C2Config::hdr_format_t, uint32_t,
+    UNKNOWN,     ///< HDR format not known (default)
+    SDR,         ///< not HDR (SDR)
+    HLG,         ///< HLG
+    HDR10,       ///< HDR10
+    HDR10_PLUS,  ///< HDR10+
+);
+
+/**
+ * HDR Format Info
+ *
+ * This information may be present during configuration to allow encoders to
+ * prepare encoding certain HDR formats. When this information is not present
+ * before start, encoders should determine the HDR format based on the available
+ * HDR metadata on the first input frame.
+ *
+ * While this information is optional, it is not a hint. When present, encoders
+ * that do not support dynamic reconfiguration do not need to switch to the HDR
+ * format based on the metadata on the first input frame.
+ */
+typedef C2StreamParam<C2Info, C2SimpleValueStruct<C2EasyEnum<C2Config::hdr_format_t>>,
+                kParamIndexHdrFormat>
+        C2StreamHdrFormatInfo;
+constexpr char C2_PARAMKEY_HDR_FORMAT[] = "coded.hdr-format";
 
 /* ------------------------------------ block-based coding ----------------------------------- */
 
@@ -1639,7 +1759,7 @@ C2ENUM(C2Config::picture_type_t, uint32_t,
     SYNC_FRAME = (1 << 0),  ///< sync frame, e.g. IDR
     I_FRAME    = (1 << 1),  ///< intra frame that is completely encoded
     P_FRAME    = (1 << 2),  ///< inter predicted frame from previous frames
-    B_FRAME    = (1 << 3),  ///< backward predicted (out-of-order) frame
+    B_FRAME    = (1 << 3),  ///< bidirectional predicted (out-of-order) frame
 )
 
 /**
@@ -1896,12 +2016,22 @@ constexpr char C2_PARAMKEY_MAX_CHANNEL_COUNT[] = "raw.max-channel-count";
 constexpr char C2_PARAMKEY_MAX_CODED_CHANNEL_COUNT[] = "coded.max-channel-count";
 
 /**
+ * Audio channel mask. Used by decoder to express audio channel mask of decoded content.
+ * Channel representation is specified according to the Java android.media.AudioFormat
+ * CHANNEL_OUT_* constants.
+ */
+ typedef C2StreamParam<C2Info, C2Uint32Value, kParamIndexAndroidChannelMask> C2StreamChannelMaskInfo;
+ const char C2_PARAMKEY_CHANNEL_MASK[] = "raw.channel-mask";
+
+/**
  * Audio sample format (PCM encoding)
  */
 C2ENUM(C2Config::pcm_encoding_t, uint32_t,
     PCM_16,
     PCM_8,
-    PCM_FLOAT
+    PCM_FLOAT,
+    PCM_24,
+    PCM_32
 )
 
 typedef C2StreamParam<C2Info, C2SimpleValueStruct<C2Config::pcm_encoding_t>, kParamIndexPcmEncoding>
@@ -2330,6 +2460,83 @@ constexpr char C2_PARAMKEY_OUTPUT_TUNNEL_HANDLE[] = "output.tunnel-handle";
 typedef C2PortParam<C2Info, C2SimpleValueStruct<int64_t>, kParamIndexTunnelSystemTime>
         C2PortTunnelSystemTime;
 constexpr char C2_PARAMKEY_OUTPUT_RENDER_TIME[] = "output.render-time";
+
+
+/**
+ * Tunneled mode video peek signaling flag.
+ *
+ * When a video frame is pushed to the decoder with this parameter set to true,
+ * the decoder must decode the frame, signal partial completion, and hold on the
+ * frame until C2StreamTunnelStartRender is set to true (which resets this
+ * flag). Flush will also result in the frames being returned back to the
+ * client (but not rendered).
+ */
+typedef C2StreamParam<C2Info, C2EasyBoolValue, kParamIndexTunnelHoldRender>
+        C2StreamTunnelHoldRender;
+constexpr char C2_PARAMKEY_TUNNEL_HOLD_RENDER[] = "output.tunnel-hold-render";
+
+/**
+ * Tunneled mode video peek signaling flag.
+ *
+ * Upon receiving this flag, the decoder shall set C2StreamTunnelHoldRender to
+ * false, which shall cause any frames held for rendering to be immediately
+ * displayed, regardless of their timestamps.
+*/
+typedef C2StreamParam<C2Info, C2EasyBoolValue, kParamIndexTunnelStartRender>
+        C2StreamTunnelStartRender;
+constexpr char C2_PARAMKEY_TUNNEL_START_RENDER[] = "output.tunnel-start-render";
+
+/** Tunnel Peek Mode. */
+C2ENUM(C2PlatformConfig::tunnel_peek_mode_t, uint32_t,
+    UNSPECIFIED_PEEK = 0,
+    SPECIFIED_PEEK = 1
+);
+
+/**
+ * Tunnel Peek Mode Tuning parameter.
+ *
+ * If set to UNSPECIFIED_PEEK_MODE, the decoder is free to ignore the
+ * C2StreamTunnelHoldRender and C2StreamTunnelStartRender flags and associated
+ * features. Additionally, it becomes up to the decoder to display any frame
+ * before receiving synchronization information.
+ *
+ * Note: This parameter allows a decoder to ignore the video peek machinery and
+ * to revert to its preferred behavior.
+ */
+typedef C2StreamParam<C2Tuning, C2EasyEnum<C2PlatformConfig::tunnel_peek_mode_t>,
+        kParamIndexTunnelPeekMode> C2StreamTunnelPeekModeTuning;
+constexpr char C2_PARAMKEY_TUNNEL_PEEK_MODE[] =
+        "output.tunnel-peek-mode";
+
+/**
+ * Encoding quality level signaling.
+ *
+ * Signal the 'minimum encoding quality' introduced in Android 12/S. It indicates
+ * whether the underlying codec is expected to take extra steps to ensure quality meets the
+ * appropriate minimum. A value of NONE indicates that the codec is not to apply
+ * any minimum quality bar requirements. Other values indicate that the codec is to apply
+ * a minimum quality bar, with the exact quality bar being decided by the parameter value.
+ */
+typedef C2GlobalParam<C2Setting,
+        C2SimpleValueStruct<C2EasyEnum<C2PlatformConfig::encoding_quality_level_t>>,
+        kParamIndexEncodingQualityLevel> C2EncodingQualityLevel;
+constexpr char C2_PARAMKEY_ENCODING_QUALITY_LEVEL[] = "algo.encoding-quality-level";
+
+C2ENUM(C2PlatformConfig::encoding_quality_level_t, uint32_t,
+    NONE = 0,
+    S_HANDHELD = 1              // corresponds to VMAF=70
+);
+
+/**
+ * Video Encoding Statistics Export
+ */
+
+/**
+ * Average block QP exported from video encoder.
+ */
+typedef C2StreamParam<C2Info, C2SimpleValueStruct<int32_t>, kParamIndexAverageBlockQuantization>
+        C2AndroidStreamAverageBlockQuantizationInfo;
+constexpr char C2_PARAMKEY_AVERAGE_QP[] = "coded.average-qp";
 
 /// @}
 

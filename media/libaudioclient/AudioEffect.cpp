@@ -32,17 +32,12 @@
 #include <private/media/AudioEffectShared.h>
 #include <utils/Log.h>
 
-#define RETURN_STATUS_IF_ERROR(x)    \
-    {                                \
-        auto _tmp = (x);             \
-        if (_tmp != OK) return _tmp; \
-    }
-
 namespace android {
 using aidl_utils::statusTFromBinderStatus;
 using binder::Status;
 using media::IAudioPolicyService;
-using media::permission::Identity;
+using media::audio::common::AudioSource;
+using media::audio::common::AudioUuid;
 
 namespace {
 
@@ -58,26 +53,26 @@ void appendToBuffer(const void* data,
 
 // ---------------------------------------------------------------------------
 
-AudioEffect::AudioEffect(const Identity& identity)
-    : mClientIdentity(identity)
+AudioEffect::AudioEffect(const android::content::AttributionSourceState& attributionSource)
+    : mClientAttributionSource(attributionSource)
 {
 }
 
 status_t AudioEffect::set(const effect_uuid_t *type,
                 const effect_uuid_t *uuid,
                 int32_t priority,
-                effect_callback_t cbf,
-                void* user,
+                const wp<IAudioEffectCallback>& callback,
                 audio_session_t sessionId,
                 audio_io_handle_t io,
                 const AudioDeviceTypeAddr& device,
-                bool probe)
+                bool probe,
+                bool notifyFramesProcessed)
 {
     sp<media::IEffect> iEffect;
     sp<IMemory> cblk;
     int enabled;
 
-    ALOGV("set %p mUserData: %p uuid: %p timeLow %08x", this, user, type, type ? type->timeLow : 0);
+    ALOGV("set %p uuid: %p timeLow %08x", this, type, type ? type->timeLow : 0);
 
     if (mIEffect != 0) {
         ALOGW("Effect already in use");
@@ -100,20 +95,19 @@ status_t AudioEffect::set(const effect_uuid_t *type,
     }
     mProbe = probe;
     mPriority = priority;
-    mCbf = cbf;
-    mUserData = user;
     mSessionId = sessionId;
+    mCallback = callback;
 
     memset(&mDescriptor, 0, sizeof(effect_descriptor_t));
     mDescriptor.type = *(type != NULL ? type : EFFECT_UUID_NULL);
     mDescriptor.uuid = *(uuid != NULL ? uuid : EFFECT_UUID_NULL);
 
-    // TODO b/182392769: use identity util
+    // TODO b/182392769: use attribution source util
     mIEffectClient = new EffectClient(this);
     pid_t pid = IPCThreadState::self()->getCallingPid();
-    mClientIdentity.pid = VALUE_OR_RETURN_STATUS(legacy2aidl_pid_t_int32_t(pid));
+    mClientAttributionSource.pid = VALUE_OR_RETURN_STATUS(legacy2aidl_pid_t_int32_t(pid));
     pid_t uid = IPCThreadState::self()->getCallingUid();
-    mClientIdentity.uid = VALUE_OR_RETURN_STATUS(legacy2aidl_uid_t_int32_t(uid));
+    mClientAttributionSource.uid = VALUE_OR_RETURN_STATUS(legacy2aidl_uid_t_int32_t(uid));
 
     media::CreateEffectRequest request;
     request.desc = VALUE_OR_RETURN_STATUS(
@@ -123,14 +117,18 @@ status_t AudioEffect::set(const effect_uuid_t *type,
     request.output = VALUE_OR_RETURN_STATUS(legacy2aidl_audio_io_handle_t_int32_t(io));
     request.sessionId = VALUE_OR_RETURN_STATUS(legacy2aidl_audio_session_t_int32_t(mSessionId));
     request.device = VALUE_OR_RETURN_STATUS(legacy2aidl_AudioDeviceTypeAddress(device));
-    request.identity = mClientIdentity;
+    request.attributionSource = mClientAttributionSource;
     request.probe = probe;
+    request.notifyFramesProcessed = notifyFramesProcessed;
 
     media::CreateEffectResponse response;
 
     mStatus = audioFlinger->createEffect(request, &response);
 
     if (mStatus == OK) {
+        if (response.alreadyExists) {
+            mStatus = ALREADY_EXISTS;
+        }
         mId = response.id;
         enabled = response.enabled;
         iEffect = response.effect;
@@ -178,7 +176,7 @@ status_t AudioEffect::set(const effect_uuid_t *type,
 
     IInterface::asBinder(iEffect)->linkToDeath(mIEffectClient);
     ALOGV("set() %p OK effect: %s id: %d status %d enabled %d pid %d", this, mDescriptor.name, mId,
-            mStatus, mEnabled, mClientIdentity.pid);
+            mStatus, mEnabled, mClientAttributionSource.pid);
 
     if (!audio_is_global_session(mSessionId)) {
         AudioSystem::acquireAudioSessionId(mSessionId, pid, uid);
@@ -187,15 +185,65 @@ status_t AudioEffect::set(const effect_uuid_t *type,
     return mStatus;
 }
 
-status_t AudioEffect::set(const char *typeStr,
-                const char *uuidStr,
+namespace {
+class LegacyCallbackWrapper : public AudioEffect::IAudioEffectCallback {
+ public:
+    LegacyCallbackWrapper(AudioEffect::legacy_callback_t callback, void* user):
+            mCallback(callback), mUser(user) {}
+ private:
+    void onControlStatusChanged(bool isGranted) override {
+        mCallback(AudioEffect::EVENT_CONTROL_STATUS_CHANGED, mUser, &isGranted);
+    }
+
+    void onEnableStatusChanged(bool isEnabled) override {
+        mCallback(AudioEffect::EVENT_ENABLE_STATUS_CHANGED, mUser, &isEnabled);
+    }
+
+    void onParameterChanged(std::vector<uint8_t> param) override {
+        mCallback(AudioEffect::EVENT_PARAMETER_CHANGED, mUser, param.data());
+    }
+
+    void onError(status_t errorCode) override {
+        mCallback(AudioEffect::EVENT_ERROR, mUser, &errorCode);
+    }
+
+    void onFramesProcessed(int32_t framesProcessed) override {
+        mCallback(AudioEffect::EVENT_FRAMES_PROCESSED, mUser, &framesProcessed);
+    }
+
+    const AudioEffect::legacy_callback_t mCallback;
+    void* const mUser;
+};
+} // namespace
+
+status_t AudioEffect::set(const effect_uuid_t *type,
+                const effect_uuid_t *uuid,
                 int32_t priority,
-                effect_callback_t cbf,
+                legacy_callback_t cbf,
                 void* user,
                 audio_session_t sessionId,
                 audio_io_handle_t io,
                 const AudioDeviceTypeAddr& device,
-                bool probe)
+                bool probe,
+                bool notifyFramesProcessed)
+{
+    if (cbf != nullptr) {
+        mLegacyWrapper = sp<LegacyCallbackWrapper>::make(cbf, user);
+    } else if (user != nullptr) {
+        LOG_ALWAYS_FATAL("%s: User provided without callback", __func__);
+    }
+    return set(type, uuid, priority, mLegacyWrapper, sessionId, io, device, probe,
+               notifyFramesProcessed);
+}
+status_t AudioEffect::set(const char *typeStr,
+                const char *uuidStr,
+                int32_t priority,
+                const wp<IAudioEffectCallback>& callback,
+                audio_session_t sessionId,
+                audio_io_handle_t io,
+                const AudioDeviceTypeAddr& device,
+                bool probe,
+                bool notifyFramesProcessed)
 {
     effect_uuid_t type;
     effect_uuid_t *pType = nullptr;
@@ -212,10 +260,29 @@ status_t AudioEffect::set(const char *typeStr,
         pUuid = &uuid;
     }
 
-    return set(pType, pUuid, priority, cbf, user, sessionId, io, device, probe);
+    return set(pType, pUuid, priority, callback, sessionId, io,
+               device, probe, notifyFramesProcessed);
 }
 
-
+status_t AudioEffect::set(const char *typeStr,
+                const char *uuidStr,
+                int32_t priority,
+                legacy_callback_t cbf,
+                void* user,
+                audio_session_t sessionId,
+                audio_io_handle_t io,
+                const AudioDeviceTypeAddr& device,
+                bool probe,
+                bool notifyFramesProcessed)
+{
+    if (cbf != nullptr) {
+        mLegacyWrapper = sp<LegacyCallbackWrapper>::make(cbf, user);
+    } else if (user != nullptr) {
+        LOG_ALWAYS_FATAL("%s: User provided without callback", __func__);
+    }
+    return set(typeStr, uuidStr, priority, mLegacyWrapper, sessionId, io, device, probe,
+               notifyFramesProcessed);
+}
 AudioEffect::~AudioEffect()
 {
     ALOGV("Destructor %p", this);
@@ -223,7 +290,7 @@ AudioEffect::~AudioEffect()
     if (!mProbe && (mStatus == NO_ERROR || mStatus == ALREADY_EXISTS)) {
         if (!audio_is_global_session(mSessionId)) {
             AudioSystem::releaseAudioSessionId(mSessionId,
-                VALUE_OR_FATAL(aidl2legacy_int32_t_pid_t(mClientIdentity.pid)));
+                VALUE_OR_FATAL(aidl2legacy_int32_t_pid_t(mClientAttributionSource.pid)));
         }
         if (mIEffect != NULL) {
             mIEffect->disconnect();
@@ -469,19 +536,18 @@ void AudioEffect::binderDied()
 {
     ALOGW("IEffect died");
     mStatus = DEAD_OBJECT;
-    if (mCbf != NULL) {
-        status_t status = DEAD_OBJECT;
-        mCbf(EVENT_ERROR, mUserData, &status);
+    auto cb = mCallback.promote();
+    if (cb != nullptr) {
+        cb->onError(mStatus);
     }
-    mIEffect.clear();
 }
 
 // -------------------------------------------------------------------------
 
 void AudioEffect::controlStatusChanged(bool controlGranted)
 {
-    ALOGV("controlStatusChanged %p control %d callback %p mUserData %p", this, controlGranted, mCbf,
-            mUserData);
+    auto cb = mCallback.promote();
+    ALOGV("controlStatusChanged %p control %d callback %p", this, controlGranted, cb.get());
     if (controlGranted) {
         if (mStatus == ALREADY_EXISTS) {
             mStatus = NO_ERROR;
@@ -491,18 +557,19 @@ void AudioEffect::controlStatusChanged(bool controlGranted)
             mStatus = ALREADY_EXISTS;
         }
     }
-    if (mCbf != NULL) {
-        mCbf(EVENT_CONTROL_STATUS_CHANGED, mUserData, &controlGranted);
+    if (cb != nullptr) {
+        cb->onControlStatusChanged(controlGranted);
     }
 }
 
 void AudioEffect::enableStatusChanged(bool enabled)
 {
-    ALOGV("enableStatusChanged %p enabled %d mCbf %p", this, enabled, mCbf);
+    auto cb = mCallback.promote();
+    ALOGV("enableStatusChanged %p enabled %d mCallback %p", this, enabled, cb.get());
     if (mStatus == ALREADY_EXISTS) {
         mEnabled = enabled;
-        if (mCbf != NULL) {
-            mCbf(EVENT_ENABLE_STATUS_CHANGED, mUserData, &enabled);
+        if (cb != nullptr) {
+            cb->onEnableStatusChanged(enabled);
         }
     }
 }
@@ -514,12 +581,20 @@ void AudioEffect::commandExecuted(int32_t cmdCode,
     if (cmdData.empty() || replyData.empty()) {
         return;
     }
-
-    if (mCbf != NULL && cmdCode == EFFECT_CMD_SET_PARAM) {
+    auto cb = mCallback.promote();
+    if (cb != nullptr && cmdCode == EFFECT_CMD_SET_PARAM) {
         std::vector<uint8_t> cmdDataCopy(cmdData);
         effect_param_t* cmd = reinterpret_cast<effect_param_t *>(cmdDataCopy.data());
         cmd->status = *reinterpret_cast<const int32_t *>(replyData.data());
-        mCbf(EVENT_PARAMETER_CHANGED, mUserData, cmd);
+        cb->onParameterChanged(std::move(cmdDataCopy));
+    }
+}
+
+void AudioEffect::framesProcessed(int32_t frames)
+{
+    auto cb = mCallback.promote();
+    if (cb != nullptr) {
+        cb->onFramesProcessed(frames);
     }
 }
 
@@ -561,7 +636,7 @@ status_t AudioEffect::queryDefaultPreProcessing(audio_session_t audioSession,
 
     int32_t audioSessionAidl = VALUE_OR_RETURN_STATUS(
             legacy2aidl_audio_session_t_int32_t(audioSession));
-    media::Int countAidl;
+    media::audio::common::Int countAidl;
     countAidl.value = VALUE_OR_RETURN_STATUS(convertIntegral<int32_t>(*count));
     std::vector<media::EffectDescriptor> retAidl;
     RETURN_STATUS_IF_ERROR(statusTFromBinderStatus(
@@ -609,12 +684,12 @@ status_t AudioEffect::addSourceDefaultEffect(const char *typeStr,
         uuid = *EFFECT_UUID_NULL;
     }
 
-    media::AudioUuid typeAidl = VALUE_OR_RETURN_STATUS(legacy2aidl_audio_uuid_t_AudioUuid(type));
-    media::AudioUuid uuidAidl = VALUE_OR_RETURN_STATUS(legacy2aidl_audio_uuid_t_AudioUuid(uuid));
+    AudioUuid typeAidl = VALUE_OR_RETURN_STATUS(legacy2aidl_audio_uuid_t_AudioUuid(type));
+    AudioUuid uuidAidl = VALUE_OR_RETURN_STATUS(legacy2aidl_audio_uuid_t_AudioUuid(uuid));
     std::string opPackageNameAidl = VALUE_OR_RETURN_STATUS(
             legacy2aidl_String16_string(opPackageName));
-    media::AudioSourceType sourceAidl = VALUE_OR_RETURN_STATUS(
-            legacy2aidl_audio_source_t_AudioSourceType(source));
+    AudioSource sourceAidl = VALUE_OR_RETURN_STATUS(
+            legacy2aidl_audio_source_t_AudioSource(source));
     int32_t retAidl;
     RETURN_STATUS_IF_ERROR(statusTFromBinderStatus(
             aps->addSourceDefaultEffect(typeAidl, opPackageNameAidl, uuidAidl, priority, sourceAidl,
@@ -652,11 +727,11 @@ status_t AudioEffect::addStreamDefaultEffect(const char *typeStr,
         uuid = *EFFECT_UUID_NULL;
     }
 
-    media::AudioUuid typeAidl = VALUE_OR_RETURN_STATUS(legacy2aidl_audio_uuid_t_AudioUuid(type));
-    media::AudioUuid uuidAidl = VALUE_OR_RETURN_STATUS(legacy2aidl_audio_uuid_t_AudioUuid(uuid));
+    AudioUuid typeAidl = VALUE_OR_RETURN_STATUS(legacy2aidl_audio_uuid_t_AudioUuid(type));
+    AudioUuid uuidAidl = VALUE_OR_RETURN_STATUS(legacy2aidl_audio_uuid_t_AudioUuid(uuid));
     std::string opPackageNameAidl = VALUE_OR_RETURN_STATUS(
             legacy2aidl_String16_string(opPackageName));
-    media::AudioUsage usageAidl = VALUE_OR_RETURN_STATUS(
+    media::audio::common::AudioUsage usageAidl = VALUE_OR_RETURN_STATUS(
             legacy2aidl_audio_usage_t_AudioUsage(usage));
     int32_t retAidl;
     RETURN_STATUS_IF_ERROR(statusTFromBinderStatus(

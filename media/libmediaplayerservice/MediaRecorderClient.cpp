@@ -126,8 +126,14 @@ status_t MediaRecorderClient::setAudioSource(int as)
     }
 
     if ((as == AUDIO_SOURCE_FM_TUNER
-            && !(captureAudioOutputAllowed(mIdentity) || captureTunerAudioInputAllowed(mIdentity)))
-            || !recordingAllowed(mIdentity)) {
+                && !(captureAudioOutputAllowed(mAttributionSource)
+                    || captureTunerAudioInputAllowed(mAttributionSource)))
+            || (as == AUDIO_SOURCE_REMOTE_SUBMIX
+                && !(captureAudioOutputAllowed(mAttributionSource)
+                    || modifyAudioRoutingAllowed(mAttributionSource)))
+            || (as == AUDIO_SOURCE_ECHO_REFERENCE
+                && !captureAudioOutputAllowed(mAttributionSource))
+            || !recordingAllowed(mAttributionSource, (audio_source_t)as)) {
         return PERMISSION_DENIED;
     }
     Mutex::Autolock lock(mLock);
@@ -377,12 +383,12 @@ status_t MediaRecorderClient::release()
 }
 
 MediaRecorderClient::MediaRecorderClient(const sp<MediaPlayerService>& service,
-        const Identity& identity)
+        const AttributionSourceState& attributionSource)
 {
     ALOGV("Client constructor");
-    // identity already validated in createMediaRecorder
-    mIdentity = identity;
-    mRecorder = new StagefrightRecorder(identity);
+    // attribution source already validated in createMediaRecorder
+    mAttributionSource = attributionSource;
+    mRecorder = new StagefrightRecorder(attributionSource);
     mMediaPlayerService = service;
 }
 

@@ -189,8 +189,12 @@ void CameraManagerGlobal::DeathNotifier::binderDied(const wp<IBinder>&)
     sp<CameraManagerGlobal> cm = mCameraManager.promote();
     if (cm != nullptr) {
         AutoMutex lock(cm->mLock);
+        std::vector<String8> cameraIdList;
         for (auto& pair : cm->mDeviceStatusMap) {
-            const String8 &cameraId = pair.first;
+            cameraIdList.push_back(pair.first);
+        }
+
+        for (String8 cameraId : cameraIdList) {
             cm->onStatusChangedLocked(
                     CameraServiceListener::STATUS_NOT_PRESENT, cameraId);
         }
@@ -688,8 +692,11 @@ camera_status_t ACameraManager::getCameraCharacteristics(
         ALOGE("%s: Cannot reach camera service!", __FUNCTION__);
         return ACAMERA_ERROR_CAMERA_DISCONNECTED;
     }
+
     CameraMetadata rawMetadata;
-    binder::Status serviceRet = cs->getCameraCharacteristics(String16(cameraIdStr), &rawMetadata);
+    int targetSdkVersion = android_get_application_target_sdk_version();
+    binder::Status serviceRet = cs->getCameraCharacteristics(String16(cameraIdStr),
+            targetSdkVersion, /*overrideToPortrait*/true, &rawMetadata);
     if (!serviceRet.isOk()) {
         switch(serviceRet.serviceSpecificErrorCode()) {
             case hardware::ICameraService::ERROR_DISCONNECTED:
@@ -735,11 +742,13 @@ ACameraManager::openCamera(
 
     sp<hardware::camera2::ICameraDeviceCallbacks> callbacks = device->getServiceCallback();
     sp<hardware::camera2::ICameraDeviceUser> deviceRemote;
+    int targetSdkVersion = android_get_application_target_sdk_version();
     // No way to get package name from native.
     // Send a zero length package name and let camera service figure it out from UID
     binder::Status serviceRet = cs->connectDevice(
             callbacks, String16(cameraId), String16(""), {},
-            hardware::ICameraService::USE_CALLING_UID, /*out*/&deviceRemote);
+            hardware::ICameraService::USE_CALLING_UID, /*oomScoreOffset*/0,
+            targetSdkVersion, /*overrideToPortrait*/true, /*out*/&deviceRemote);
 
     if (!serviceRet.isOk()) {
         ALOGE("%s: connect camera device failed: %s", __FUNCTION__, serviceRet.toString8().string());

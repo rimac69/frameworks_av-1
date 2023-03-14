@@ -46,6 +46,7 @@ cc_fuzz {
     ],
     shared_libs: [
         "android.hardware.audio.common-util",
+        "android.media.audio.common.types-V1-cpp",
         "audioclient-types-aidl-cpp",
         "audioflinger-aidl-cpp",
         "audiopolicy-aidl-cpp",
@@ -65,7 +66,7 @@ cc_fuzz {
         "libutils",
         "libxml2",
         "mediametricsservice-aidl-cpp",
-        "media_permission-aidl-cpp",
+        "framework-permission-aidl-cpp",
     ],
     header_libs: [
         "libaudiofoundation_headers",

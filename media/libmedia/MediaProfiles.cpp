@@ -20,12 +20,14 @@
 #define LOG_TAG "MediaProfiles"
 
 #include <stdlib.h>
+#include <utils/misc.h>
 #include <utils/Log.h>
 #include <utils/Vector.h>
 #include <cutils/properties.h>
 #include <expat.h>
 #include <media/MediaProfiles.h>
 #include <media/stagefright/foundation/ADebug.h>
+#include <media/stagefright/MediaCodecConstants.h>
 #include <OMX_Video.h>
 #include <sys/stat.h>
 
@@ -86,7 +88,24 @@ const MediaProfiles::NameToTagMap MediaProfiles::sVideoEncoderNameMap[] = {
     {"h263", VIDEO_ENCODER_H263},
     {"h264", VIDEO_ENCODER_H264},
     {"m4v",  VIDEO_ENCODER_MPEG_4_SP},
-    {"hevc", VIDEO_ENCODER_HEVC}
+    {"vp8",  VIDEO_ENCODER_VP8},
+    {"hevc", VIDEO_ENCODER_HEVC},
+    {"vp9",  VIDEO_ENCODER_VP9},
+    {"dolbyvision", VIDEO_ENCODER_DOLBY_VISION},
+};
+
+const MediaProfiles::NameToTagMap MediaProfiles::sChromaSubsamplingNameMap[] = {
+    {"yuv 4:2:0", CHROMA_SUBSAMPLING_YUV_420},
+    {"yuv 4:2:2", CHROMA_SUBSAMPLING_YUV_422},
+    {"yuv 4:4:4", CHROMA_SUBSAMPLING_YUV_444},
+};
+
+const MediaProfiles::NameToTagMap MediaProfiles::sHdrFormatNameMap[] = {
+    {"sdr", HDR_FORMAT_NONE},
+    {"hlg", HDR_FORMAT_HLG},
+    {"hdr10", HDR_FORMAT_HDR10},
+    {"hdr10+", HDR_FORMAT_HDR10PLUS},
+    {"dolbyvision", HDR_FORMAT_DOLBY_VISION},
 };
 
 const MediaProfiles::NameToTagMap MediaProfiles::sAudioEncoderNameMap[] = {
@@ -164,11 +183,18 @@ const MediaProfiles::NameToTagMap MediaProfiles::sCamcorderQualityNameMap[] = {
 MediaProfiles::logVideoCodec(const MediaProfiles::VideoCodec& codec UNUSED)
 {
     ALOGV("video codec:");
-    ALOGV("codec = %d", codec.mCodec);
+    ALOGV("codec = %d (%s)", codec.mCodec,
+            findNameForTag(sVideoEncoderNameMap, NELEM(sVideoEncoderNameMap), codec.mCodec));
     ALOGV("bit rate: %d", codec.mBitRate);
     ALOGV("frame width: %d", codec.mFrameWidth);
     ALOGV("frame height: %d", codec.mFrameHeight);
     ALOGV("frame rate: %d", codec.mFrameRate);
+    ALOGV("profile: %d", codec.mProfile);
+    ALOGV("chroma: %s", findNameForTag(sChromaSubsamplingNameMap, NELEM(sChromaSubsamplingNameMap),
+                                       codec.mChromaSubsampling));
+    ALOGV("bit depth: %d", codec.mBitDepth);
+    ALOGV("hdr format: %s", findNameForTag(sHdrFormatNameMap, NELEM(sHdrFormatNameMap),
+                                           codec.mHdrFormat));
 }
 
 /*static*/ void
@@ -179,6 +205,7 @@ MediaProfiles::logAudioCodec(const MediaProfiles::AudioCodec& codec UNUSED)
     ALOGV("bit rate: %d", codec.mBitRate);
     ALOGV("sample rate: %d", codec.mSampleRate);
     ALOGV("number of channels: %d", codec.mChannels);
+    ALOGV("profile: %d", codec.mProfile);
 }
 
 /*static*/ void
@@ -230,10 +257,160 @@ MediaProfiles::findTagForName(const MediaProfiles::NameToTagMap *map, size_t nMa
     return tag;
 }
 
-/*static*/ MediaProfiles::VideoCodec*
-MediaProfiles::createVideoCodec(const char **atts, MediaProfiles *profiles)
+/*static*/ const char *
+MediaProfiles::findNameForTag(
+        const MediaProfiles::NameToTagMap *map, size_t nMappings, int tag, const char *def_)
 {
-    CHECK(!strcmp("codec",     atts[0]) &&
+    for (size_t i = 0; i < nMappings; ++i) {
+        if (map[i].tag == tag) {
+            return map[i].name;
+        }
+    }
+    return def_;
+}
+
+/*static*/ bool
+MediaProfiles::detectAdvancedVideoProfile(
+        video_encoder codec, int profile,
+        chroma_subsampling *chroma, int *bitDepth, hdr_format *hdr)
+{
+    // default values
+    *chroma = CHROMA_SUBSAMPLING_YUV_420;
+    *bitDepth = 8;
+    *hdr = HDR_FORMAT_NONE;
+
+    switch (codec) {
+    case VIDEO_ENCODER_H263:
+    case VIDEO_ENCODER_MPEG_4_SP:
+    case VIDEO_ENCODER_VP8:
+        // these are always 4:2:0 SDR 8-bit
+        return true;
+
+    case VIDEO_ENCODER_H264:
+        switch (profile) {
+        case AVCProfileBaseline:
+        case AVCProfileConstrainedBaseline:
+        case AVCProfileMain:
+        case AVCProfileExtended:
+        case AVCProfileHigh:
+        case AVCProfileConstrainedHigh:
+            return true;
+        case AVCProfileHigh10:
+            // returning false here as this could be an HLG stream
+            *bitDepth = 10;
+            return false;
+        case AVCProfileHigh422:
+            *chroma = CHROMA_SUBSAMPLING_YUV_422;
+            // returning false here as bit-depth could be 8 or 10
+            return false;
+        case AVCProfileHigh444:
+            *chroma = CHROMA_SUBSAMPLING_YUV_444;
+            // returning false here as bit-depth could be 8 or 10
+            return false;
+        default:
+            return false;
+        }
+        // flow does not get here
+
+    case VIDEO_ENCODER_HEVC:
+        switch (profile) {
+        case HEVCProfileMain:
+            return true;
+        case HEVCProfileMain10:
+            *bitDepth = 10;
+            // returning false here as this could be an HLG stream
+            return false;
+        case HEVCProfileMain10HDR10:
+            *bitDepth = 10;
+            *hdr = HDR_FORMAT_HDR10;
+            return true;
+        case HEVCProfileMain10HDR10Plus:
+            *bitDepth = 10;
+            *hdr = HDR_FORMAT_HDR10PLUS;
+            return true;
+        default:
+            return false;
+        }
+        // flow does not get here
+
+    case VIDEO_ENCODER_VP9:
+        switch (profile) {
+        case VP9Profile0:
+            return true;
+        case VP9Profile2:
+            // this is always 10-bit on Android */
+            *bitDepth = 10;
+            // returning false here as this could be an HLG stream
+            return false;
+        case VP9Profile2HDR:
+            // this is always 10-bit on Android */
+            *bitDepth = 10;
+            *hdr = HDR_FORMAT_HDR10;
+            return true;
+        case VP9Profile2HDR10Plus:
+            *bitDepth = 10;
+            *hdr = HDR_FORMAT_HDR10PLUS;
+            return true;
+        default:
+            return false;
+        }
+        // flow does not get here
+
+    case VIDEO_ENCODER_DOLBY_VISION:
+    {
+        // for Dolby Vision codec we always assume 10-bit DV
+        *bitDepth = 10;
+        *hdr = HDR_FORMAT_DOLBY_VISION;
+
+        switch (profile) {
+        case DolbyVisionProfileDvheDer /* profile 2 deprecated */:
+        case DolbyVisionProfileDvheDen /* profile 3 deprecated */:
+        case DolbyVisionProfileDvavPer /* profile 0 deprecated */:
+        case DolbyVisionProfileDvavPen /* profile 1 deprecated */:
+        case DolbyVisionProfileDvheDtr /* dvhe.04 */:
+        case DolbyVisionProfileDvheStn /* dvhe.05 */:
+        case DolbyVisionProfileDvheDth /* profile 6 deprecated */:
+        case DolbyVisionProfileDvheDtb /* dvhe.07 */:
+        case DolbyVisionProfileDvheSt  /* dvhe.08 */:
+        case DolbyVisionProfileDvavSe  /* dvav.09 */:
+        case DolbyVisionProfileDvav110 /* dvav1.10 */:
+            return true;
+        default:
+            return false;
+        }
+        // flow does not get here
+    }
+
+    case VIDEO_ENCODER_AV1:
+        switch (profile) {
+        case AV1ProfileMain10:
+            *bitDepth = 10;
+            // returning false here as this could be an HLG stream
+            return false;
+        case AV1ProfileMain10HDR10:
+            *bitDepth = 10;
+            *hdr = HDR_FORMAT_HDR10;
+            return true;
+        case AV1ProfileMain10HDR10Plus:
+            *bitDepth = 10;
+            *hdr = HDR_FORMAT_HDR10PLUS;
+            return true;
+        default:
+            return false;
+        }
+        // flow does not get here
+
+    default:
+        return false;
+    }
+    // flow does not get here
+}
+
+/*static*/ void
+MediaProfiles::createVideoCodec(const char **atts, size_t natts, MediaProfiles *profiles)
+{
+    CHECK(natts >= 10 &&
+          !strcmp("codec",     atts[0]) &&
           !strcmp("bitRate",   atts[2]) &&
           !strcmp("width",     atts[4]) &&
           !strcmp("height",    atts[6]) &&
@@ -242,49 +419,103 @@ MediaProfiles::createVideoCodec(const char **atts, MediaProfiles *profiles)
     const size_t nMappings = sizeof(sVideoEncoderNameMap)/sizeof(sVideoEncoderNameMap[0]);
     const int codec = findTagForName(sVideoEncoderNameMap, nMappings, atts[1]);
     if (codec == -1) {
-      ALOGE("MediaProfiles::createVideoCodec failed to locate codec %s", atts[1]);
-      return nullptr;
+        ALOGE("MediaProfiles::createVideoCodec failed to locate codec %s", atts[1]);
+        return;
     }
 
-    MediaProfiles::VideoCodec *videoCodec =
-        new MediaProfiles::VideoCodec(static_cast<video_encoder>(codec),
-            atoi(atts[3]), atoi(atts[5]), atoi(atts[7]), atoi(atts[9]));
-    logVideoCodec(*videoCodec);
+    int profile = -1;
+    chroma_subsampling chroma = CHROMA_SUBSAMPLING_YUV_420;
+    int bitDepth = 8;
+    hdr_format hdr = HDR_FORMAT_NONE;
+    if (codec == VIDEO_ENCODER_DOLBY_VISION) {
+        bitDepth = 10;
+        hdr = HDR_FORMAT_DOLBY_VISION;
+    }
+
+    if (natts >= 12 && !strcmp("profile", atts[10])) {
+        profile = atoi(atts[11]);
+        if (!detectAdvancedVideoProfile(
+                (video_encoder)codec, profile, &chroma, &bitDepth, &hdr)) {
+            // if not detected read values from the attributes
+            for (size_t ix = 12; natts >= ix + 2; ix += 2) {
+                if (!strcmp("chroma", atts[ix])) {
+                    int chromaTag = findTagForName(sChromaSubsamplingNameMap,
+                                         NELEM(sChromaSubsamplingNameMap), atts[ix + 1]);
+                    if (chromaTag == -1) {
+                        ALOGE("MediaProfiles::createVideoCodec invalid chroma %s", atts[ix + 1]);
+                        return;
+                    } else {
+                        chroma = (chroma_subsampling)chromaTag;
+                    }
+                } else if (!strcmp("bitDepth", atts[ix])) {
+                    bitDepth = atoi(atts[ix + 1]);
+                    if (bitDepth < 8 || bitDepth > 16) {
+                        ALOGE("MediaProfiles::createVideoCodec invalid bidDepth %s", atts[ix + 1]);
+                        return;
+                    }
+                } else if (!strcmp("hdr", atts[ix])) {
+                    int hdrTag = findTagForName(sHdrFormatNameMap,
+                                                NELEM(sHdrFormatNameMap), atts[ix + 1]);
+                    if (hdrTag == -1) {
+                        ALOGE("MediaProfiles::createVideoCodec invalid hdr %s", atts[ix + 1]);
+                        return;
+                    } else {
+                        hdr = (hdr_format)hdrTag;
+                    }
+                } else {
+                    // ignoring here. TODO: rewrite this whole file to ignore invalid attrs
+                    ALOGD("MediaProfiles::createVideoCodec ignoring invalid attr %s", atts[ix]);
+                }
+            }
+        }
+    }
+
+    VideoCodec videoCodec{
+            static_cast<video_encoder>(codec),
+            atoi(atts[3]) /* bitRate */, atoi(atts[5]) /* width */, atoi(atts[7]) /* height */,
+            atoi(atts[9]) /* frameRate */, profile, chroma, bitDepth, hdr };
+    logVideoCodec(videoCodec);
 
     size_t nCamcorderProfiles;
     CHECK((nCamcorderProfiles = profiles->mCamcorderProfiles.size()) >= 1);
-    profiles->mCamcorderProfiles[nCamcorderProfiles - 1]->mVideoCodec = videoCodec;
-    return videoCodec;
+    profiles->mCamcorderProfiles[nCamcorderProfiles - 1]->mVideoCodecs.emplace_back(videoCodec);
 }
 
-/*static*/ MediaProfiles::AudioCodec*
-MediaProfiles::createAudioCodec(const char **atts, MediaProfiles *profiles)
+/*static*/ void
+MediaProfiles::createAudioCodec(const char **atts, size_t natts, MediaProfiles *profiles)
 {
-    CHECK(!strcmp("codec",      atts[0]) &&
+    CHECK(natts >= 8 &&
+          !strcmp("codec",      atts[0]) &&
           !strcmp("bitRate",    atts[2]) &&
           !strcmp("sampleRate", atts[4]) &&
           !strcmp("channels",   atts[6]));
     const size_t nMappings = sizeof(sAudioEncoderNameMap)/sizeof(sAudioEncoderNameMap[0]);
     const int codec = findTagForName(sAudioEncoderNameMap, nMappings, atts[1]);
     if (codec == -1) {
-      ALOGE("MediaProfiles::createAudioCodec failed to locate codec %s", atts[1]);
-      return nullptr;
+        ALOGE("MediaProfiles::createAudioCodec failed to locate codec %s", atts[1]);
+        return;
     }
 
-    MediaProfiles::AudioCodec *audioCodec =
-        new MediaProfiles::AudioCodec(static_cast<audio_encoder>(codec),
-            atoi(atts[3]), atoi(atts[5]), atoi(atts[7]));
-    logAudioCodec(*audioCodec);
+    int profile = -1;
+    if (natts >= 10 && !strcmp("profile", atts[8])) {
+        profile = atoi(atts[9]);
+    }
+
+    AudioCodec audioCodec{
+            static_cast<audio_encoder>(codec),
+            atoi(atts[3]), atoi(atts[5]), atoi(atts[7]), profile };
+    logAudioCodec(audioCodec);
 
     size_t nCamcorderProfiles;
     CHECK((nCamcorderProfiles = profiles->mCamcorderProfiles.size()) >= 1);
-    profiles->mCamcorderProfiles[nCamcorderProfiles - 1]->mAudioCodec = audioCodec;
-    return audioCodec;
+    profiles->mCamcorderProfiles[nCamcorderProfiles - 1]->mAudioCodecs.emplace_back(audioCodec);
 }
+
 /*static*/ MediaProfiles::AudioDecoderCap*
-MediaProfiles::createAudioDecoderCap(const char **atts)
+MediaProfiles::createAudioDecoderCap(const char **atts, size_t natts)
 {
-    CHECK(!strcmp("name",    atts[0]) &&
+    CHECK(natts >= 4 &&
+          !strcmp("name",    atts[0]) &&
           !strcmp("enabled", atts[2]));
 
     const size_t nMappings = sizeof(sAudioDecoderNameMap)/sizeof(sAudioDecoderNameMap[0]);
@@ -301,9 +532,10 @@ MediaProfiles::createAudioDecoderCap(const char **atts)
 }
 
 /*static*/ MediaProfiles::VideoDecoderCap*
-MediaProfiles::createVideoDecoderCap(const char **atts)
+MediaProfiles::createVideoDecoderCap(const char **atts, size_t natts)
 {
-    CHECK(!strcmp("name",    atts[0]) &&
+    CHECK(natts >= 4 &&
+          !strcmp("name",    atts[0]) &&
           !strcmp("enabled", atts[2]));
 
     const size_t nMappings = sizeof(sVideoDecoderNameMap)/sizeof(sVideoDecoderNameMap[0]);
@@ -320,9 +552,10 @@ MediaProfiles::createVideoDecoderCap(const char **atts)
 }
 
 /*static*/ MediaProfiles::VideoEncoderCap*
-MediaProfiles::createVideoEncoderCap(const char **atts)
+MediaProfiles::createVideoEncoderCap(const char **atts, size_t natts)
 {
-    CHECK(!strcmp("name",           atts[0])  &&
+    CHECK(natts >= 20 &&
+          !strcmp("name",           atts[0])  &&
           !strcmp("enabled",        atts[2])  &&
           !strcmp("minBitRate",     atts[4])  &&
           !strcmp("maxBitRate",     atts[6])  &&
@@ -349,9 +582,10 @@ MediaProfiles::createVideoEncoderCap(const char **atts)
 }
 
 /*static*/ MediaProfiles::AudioEncoderCap*
-MediaProfiles::createAudioEncoderCap(const char **atts)
+MediaProfiles::createAudioEncoderCap(const char **atts, size_t natts)
 {
-    CHECK(!strcmp("name",          atts[0])  &&
+    CHECK(natts >= 16 &&
+          !strcmp("name",          atts[0])  &&
           !strcmp("enabled",       atts[2])  &&
           !strcmp("minBitRate",    atts[4])  &&
           !strcmp("maxBitRate",    atts[6])  &&
@@ -375,9 +609,10 @@ MediaProfiles::createAudioEncoderCap(const char **atts)
 }
 
 /*static*/ output_format
-MediaProfiles::createEncoderOutputFileFormat(const char **atts)
+MediaProfiles::createEncoderOutputFileFormat(const char **atts, size_t natts)
 {
-    CHECK(!strcmp("name", atts[0]));
+    CHECK(natts >= 2 &&
+          !strcmp("name", atts[0]));
 
     const size_t nMappings =sizeof(sFileFormatMap)/sizeof(sFileFormatMap[0]);
     const int format = findTagForName(sFileFormatMap, nMappings, atts[1]);
@@ -396,9 +631,11 @@ static bool isCameraIdFound(int cameraId, const Vector<int>& cameraIds) {
 }
 
 /*static*/ MediaProfiles::CamcorderProfile*
-MediaProfiles::createCamcorderProfile(int cameraId, const char **atts, Vector<int>& cameraIds)
+MediaProfiles::createCamcorderProfile(
+        int cameraId, const char **atts, size_t natts, Vector<int>& cameraIds)
 {
-    CHECK(!strcmp("quality",    atts[0]) &&
+    CHECK(natts >= 6 &&
+          !strcmp("quality",    atts[0]) &&
           !strcmp("fileFormat", atts[2]) &&
           !strcmp("duration",   atts[4]));
 
@@ -441,9 +678,10 @@ MediaProfiles::findImageEncodingQualityLevels(int cameraId) const
     return NULL;
 }
 
-void MediaProfiles::addImageEncodingQualityLevel(int cameraId, const char** atts)
+void MediaProfiles::addImageEncodingQualityLevel(int cameraId, const char** atts, size_t natts)
 {
-    CHECK(!strcmp("quality", atts[0]));
+    CHECK(natts >= 2 &&
+          !strcmp("quality", atts[0]));
     int quality = atoi(atts[1]);
     ALOGV("%s: cameraId=%d, quality=%d", __func__, cameraId, quality);
     ImageEncodingQualityLevels *levels = findImageEncodingQualityLevels(cameraId);
@@ -458,18 +696,19 @@ void MediaProfiles::addImageEncodingQualityLevel(int cameraId, const char** atts
 }
 
 /*static*/ int
-MediaProfiles::getCameraId(const char** atts)
+MediaProfiles::getCameraId(const char** atts, size_t natts)
 {
     if (!atts[0]) return 0;  // default cameraId = 0
-    CHECK(!strcmp("cameraId", atts[0]));
+    CHECK(natts >= 2 &&
+          !strcmp("cameraId", atts[0]));
     return atoi(atts[1]);
 }
 
-void MediaProfiles::addStartTimeOffset(int cameraId, const char** atts)
+void MediaProfiles::addStartTimeOffset(int cameraId, const char** atts, size_t natts)
 {
     int offsetTimeMs = 1000;
-    if (atts[2]) {
-        CHECK(!strcmp("startOffsetMs", atts[2]));
+    if (natts >= 3 && atts[2]) {
+        CHECK(natts >= 4 && !strcmp("startOffsetMs", atts[2]));
         offsetTimeMs = atoi(atts[3]);
     }
 
@@ -480,48 +719,58 @@ void MediaProfiles::addStartTimeOffset(int cameraId, const char** atts)
 /*static*/ void
 MediaProfiles::startElementHandler(void *userData, const char *name, const char **atts)
 {
-    MediaProfiles *profiles = (MediaProfiles *) userData;
+    // determine number of attributes
+    size_t natts = 0;
+    while (atts[natts]) {
+        ++natts;
+    }
+
+    MediaProfiles *profiles = (MediaProfiles *)userData;
     if (strcmp("Video", name) == 0) {
-        createVideoCodec(atts, profiles);
+        createVideoCodec(atts, natts, profiles);
     } else if (strcmp("Audio", name) == 0) {
-        createAudioCodec(atts, profiles);
+        createAudioCodec(atts, natts, profiles);
     } else if (strcmp("VideoEncoderCap", name) == 0 &&
+               natts >= 4 &&
                strcmp("true", atts[3]) == 0) {
-        MediaProfiles::VideoEncoderCap* cap = createVideoEncoderCap(atts);
+        MediaProfiles::VideoEncoderCap* cap = createVideoEncoderCap(atts, natts);
         if (cap != nullptr) {
           profiles->mVideoEncoders.add(cap);
         }
     } else if (strcmp("AudioEncoderCap", name) == 0 &&
+               natts >= 4 &&
                strcmp("true", atts[3]) == 0) {
-        MediaProfiles::AudioEncoderCap* cap = createAudioEncoderCap(atts);
+        MediaProfiles::AudioEncoderCap* cap = createAudioEncoderCap(atts, natts);
         if (cap != nullptr) {
           profiles->mAudioEncoders.add(cap);
         }
     } else if (strcmp("VideoDecoderCap", name) == 0 &&
+               natts >= 4 &&
                strcmp("true", atts[3]) == 0) {
-        MediaProfiles::VideoDecoderCap* cap = createVideoDecoderCap(atts);
+        MediaProfiles::VideoDecoderCap* cap = createVideoDecoderCap(atts, natts);
         if (cap != nullptr) {
           profiles->mVideoDecoders.add(cap);
         }
     } else if (strcmp("AudioDecoderCap", name) == 0 &&
+               natts >= 4 &&
                strcmp("true", atts[3]) == 0) {
-        MediaProfiles::AudioDecoderCap* cap = createAudioDecoderCap(atts);
+        MediaProfiles::AudioDecoderCap* cap = createAudioDecoderCap(atts, natts);
         if (cap != nullptr) {
           profiles->mAudioDecoders.add(cap);
         }
     } else if (strcmp("EncoderOutputFileFormat", name) == 0) {
-        profiles->mEncoderOutputFileFormats.add(createEncoderOutputFileFormat(atts));
+        profiles->mEncoderOutputFileFormats.add(createEncoderOutputFileFormat(atts, natts));
     } else if (strcmp("CamcorderProfiles", name) == 0) {
-        profiles->mCurrentCameraId = getCameraId(atts);
-        profiles->addStartTimeOffset(profiles->mCurrentCameraId, atts);
+        profiles->mCurrentCameraId = getCameraId(atts, natts);
+        profiles->addStartTimeOffset(profiles->mCurrentCameraId, atts, natts);
     } else if (strcmp("EncoderProfile", name) == 0) {
       MediaProfiles::CamcorderProfile* profile = createCamcorderProfile(
-          profiles->mCurrentCameraId, atts, profiles->mCameraIds);
+          profiles->mCurrentCameraId, atts, natts, profiles->mCameraIds);
       if (profile != nullptr) {
         profiles->mCamcorderProfiles.add(profile);
       }
     } else if (strcmp("ImageEncoding", name) == 0) {
-        profiles->addImageEncodingQualityLevel(profiles->mCurrentCameraId, atts);
+        profiles->addImageEncodingQualityLevel(profiles->mCurrentCameraId, atts, natts);
     }
 }
 
@@ -575,8 +824,20 @@ void MediaProfiles::checkAndAddRequiredProfilesIfNecessary() {
     initRequiredProfileRefs(mCameraIds);
 
     for (size_t i = 0, n = mCamcorderProfiles.size(); i < n; ++i) {
-        int product = mCamcorderProfiles[i]->mVideoCodec->mFrameWidth *
-                      mCamcorderProfiles[i]->mVideoCodec->mFrameHeight;
+        // ensure at least one video and audio profile is added
+        if (mCamcorderProfiles[i]->mVideoCodecs.empty()) {
+            mCamcorderProfiles[i]->mVideoCodecs.emplace_back(
+                    VIDEO_ENCODER_H263, 192000 /* bitrate */,
+                    176 /* width */, 144 /* height */, 20 /* frameRate */);
+        }
+        if (mCamcorderProfiles[i]->mAudioCodecs.empty()) {
+            mCamcorderProfiles[i]->mAudioCodecs.emplace_back(
+                    AUDIO_ENCODER_AMR_NB, 12200 /* bitrate */,
+                    8000 /* sampleRate */, 1 /* channels */);
+        }
+
+        int product = mCamcorderProfiles[i]->mVideoCodecs[0].mFrameWidth *
+                      mCamcorderProfiles[i]->mVideoCodecs[0].mFrameHeight;
 
         camcorder_quality quality = mCamcorderProfiles[i]->mQuality;
         int cameraId = mCamcorderProfiles[i]->mCameraId;
@@ -745,34 +1006,35 @@ MediaProfiles::createDefaultVideoEncoders(MediaProfiles *profiles)
 /*static*/ MediaProfiles::CamcorderProfile*
 MediaProfiles::createDefaultCamcorderTimeLapseQcifProfile(camcorder_quality quality)
 {
-    MediaProfiles::VideoCodec *videoCodec =
-        new MediaProfiles::VideoCodec(VIDEO_ENCODER_H263, 1000000, 176, 144, 20);
-
-    AudioCodec *audioCodec = new AudioCodec(AUDIO_ENCODER_AMR_NB, 12200, 8000, 1);
     CamcorderProfile *profile = new MediaProfiles::CamcorderProfile;
     profile->mCameraId = 0;
     profile->mFileFormat = OUTPUT_FORMAT_THREE_GPP;
     profile->mQuality = quality;
     profile->mDuration = 60;
-    profile->mVideoCodec = videoCodec;
-    profile->mAudioCodec = audioCodec;
+    profile->mVideoCodecs.emplace_back(
+            VIDEO_ENCODER_H263, 1000000 /* bitrate */,
+            176 /* width */, 144 /* height */, 20 /* frameRate */);
+    profile->mAudioCodecs.emplace_back(
+            AUDIO_ENCODER_AMR_NB, 12200 /* bitrate */,
+            8000 /* sampleRate */, 1 /* channels */);
+
     return profile;
 }
 
 /*static*/ MediaProfiles::CamcorderProfile*
 MediaProfiles::createDefaultCamcorderTimeLapse480pProfile(camcorder_quality quality)
 {
-    MediaProfiles::VideoCodec *videoCodec =
-        new MediaProfiles::VideoCodec(VIDEO_ENCODER_H263, 20000000, 720, 480, 20);
-
-    AudioCodec *audioCodec = new AudioCodec(AUDIO_ENCODER_AMR_NB, 12200, 8000, 1);
     CamcorderProfile *profile = new MediaProfiles::CamcorderProfile;
     profile->mCameraId = 0;
     profile->mFileFormat = OUTPUT_FORMAT_THREE_GPP;
     profile->mQuality = quality;
     profile->mDuration = 60;
-    profile->mVideoCodec = videoCodec;
-    profile->mAudioCodec = audioCodec;
+    profile->mVideoCodecs.emplace_back(
+            VIDEO_ENCODER_H263, 20000000 /* bitrate */,
+            720 /* width */, 480 /* height */, 20 /* frameRate */);
+    profile->mAudioCodecs.emplace_back(
+            AUDIO_ENCODER_AMR_NB, 12200 /* bitrate */,
+            8000 /* sampleRate */, 1 /* channels */);
     return profile;
 }
 
@@ -799,36 +1061,34 @@ MediaProfiles::createDefaultCamcorderTimeLapseHighProfiles(
 /*static*/ MediaProfiles::CamcorderProfile*
 MediaProfiles::createDefaultCamcorderQcifProfile(camcorder_quality quality)
 {
-    MediaProfiles::VideoCodec *videoCodec =
-        new MediaProfiles::VideoCodec(VIDEO_ENCODER_H263, 192000, 176, 144, 20);
-
-    MediaProfiles::AudioCodec *audioCodec =
-        new MediaProfiles::AudioCodec(AUDIO_ENCODER_AMR_NB, 12200, 8000, 1);
-
-    MediaProfiles::CamcorderProfile *profile = new MediaProfiles::CamcorderProfile;
+    CamcorderProfile *profile = new MediaProfiles::CamcorderProfile;
     profile->mCameraId = 0;
     profile->mFileFormat = OUTPUT_FORMAT_THREE_GPP;
     profile->mQuality = quality;
     profile->mDuration = 30;
-    profile->mVideoCodec = videoCodec;
-    profile->mAudioCodec = audioCodec;
+    profile->mVideoCodecs.emplace_back(
+            VIDEO_ENCODER_H263, 192000 /* bitrate */,
+            176 /* width */, 144 /* height */, 20 /* frameRate */);
+    profile->mAudioCodecs.emplace_back(
+            AUDIO_ENCODER_AMR_NB, 12200 /* bitrate */,
+            8000 /* sampleRate */, 1 /* channels */);
     return profile;
 }
 
 /*static*/ MediaProfiles::CamcorderProfile*
 MediaProfiles::createDefaultCamcorderCifProfile(camcorder_quality quality)
 {
-    MediaProfiles::VideoCodec *videoCodec =
-        new MediaProfiles::VideoCodec(VIDEO_ENCODER_H263, 360000, 352, 288, 20);
-
-    AudioCodec *audioCodec = new AudioCodec(AUDIO_ENCODER_AMR_NB, 12200, 8000, 1);
     CamcorderProfile *profile = new MediaProfiles::CamcorderProfile;
     profile->mCameraId = 0;
     profile->mFileFormat = OUTPUT_FORMAT_THREE_GPP;
     profile->mQuality = quality;
     profile->mDuration = 60;
-    profile->mVideoCodec = videoCodec;
-    profile->mAudioCodec = audioCodec;
+    profile->mVideoCodecs.emplace_back(
+            VIDEO_ENCODER_H263, 360000 /* bitrate */,
+            352 /* width */, 288 /* height */, 20 /* frameRate */);
+    profile->mAudioCodecs.emplace_back(
+            AUDIO_ENCODER_AMR_NB, 12200 /* bitrate */,
+            8000 /* sampleRate */, 1 /* channels */);
     return profile;
 }
 
@@ -1112,6 +1372,36 @@ int MediaProfiles::getCamcorderProfileIndex(int cameraId, camcorder_quality qual
     return index;
 }
 
+const MediaProfiles::CamcorderProfile *MediaProfiles::getCamcorderProfile(
+            int cameraId, camcorder_quality quality) const {
+    int index = getCamcorderProfileIndex(cameraId, quality);
+    if (index == -1) {
+        ALOGE("The given camcorder profile camera %d quality %d is not found",
+            cameraId, quality);
+        return nullptr;
+    }
+
+    return mCamcorderProfiles[index];
+}
+
+std::vector<const MediaProfiles::AudioCodec *>
+MediaProfiles::CamcorderProfile::getAudioCodecs() const {
+    std::vector<const MediaProfiles::AudioCodec *> res;
+    for (const MediaProfiles::AudioCodec &ac : mAudioCodecs) {
+        res.push_back(&ac);
+    }
+    return res;
+}
+
+std::vector<const MediaProfiles::VideoCodec *>
+MediaProfiles::CamcorderProfile::getVideoCodecs() const {
+    std::vector<const MediaProfiles::VideoCodec *> res;
+    for (const MediaProfiles::VideoCodec &vc : mVideoCodecs) {
+        res.push_back(&vc);
+    }
+    return res;
+}
+
 int MediaProfiles::getCamcorderProfileParamByName(const char *name,
                                                   int cameraId,
                                                   camcorder_quality quality) const
@@ -1128,15 +1418,15 @@ int MediaProfiles::getCamcorderProfileParamByName(const char *name,
 
     if (!strcmp("duration", name)) return mCamcorderProfiles[index]->mDuration;
     if (!strcmp("file.format", name)) return mCamcorderProfiles[index]->mFileFormat;
-    if (!strcmp("vid.codec", name)) return mCamcorderProfiles[index]->mVideoCodec->mCodec;
-    if (!strcmp("vid.width", name)) return mCamcorderProfiles[index]->mVideoCodec->mFrameWidth;
-    if (!strcmp("vid.height", name)) return mCamcorderProfiles[index]->mVideoCodec->mFrameHeight;
-    if (!strcmp("vid.bps", name)) return mCamcorderProfiles[index]->mVideoCodec->mBitRate;
-    if (!strcmp("vid.fps", name)) return mCamcorderProfiles[index]->mVideoCodec->mFrameRate;
-    if (!strcmp("aud.codec", name)) return mCamcorderProfiles[index]->mAudioCodec->mCodec;
-    if (!strcmp("aud.bps", name)) return mCamcorderProfiles[index]->mAudioCodec->mBitRate;
-    if (!strcmp("aud.ch", name)) return mCamcorderProfiles[index]->mAudioCodec->mChannels;
-    if (!strcmp("aud.hz", name)) return mCamcorderProfiles[index]->mAudioCodec->mSampleRate;
+    if (!strcmp("vid.codec", name)) return mCamcorderProfiles[index]->mVideoCodecs[0].mCodec;
+    if (!strcmp("vid.width", name)) return mCamcorderProfiles[index]->mVideoCodecs[0].mFrameWidth;
+    if (!strcmp("vid.height", name)) return mCamcorderProfiles[index]->mVideoCodecs[0].mFrameHeight;
+    if (!strcmp("vid.bps", name)) return mCamcorderProfiles[index]->mVideoCodecs[0].mBitRate;
+    if (!strcmp("vid.fps", name)) return mCamcorderProfiles[index]->mVideoCodecs[0].mFrameRate;
+    if (!strcmp("aud.codec", name)) return mCamcorderProfiles[index]->mAudioCodecs[0].mCodec;
+    if (!strcmp("aud.bps", name)) return mCamcorderProfiles[index]->mAudioCodecs[0].mBitRate;
+    if (!strcmp("aud.ch", name)) return mCamcorderProfiles[index]->mAudioCodecs[0].mChannels;
+    if (!strcmp("aud.hz", name)) return mCamcorderProfiles[index]->mAudioCodecs[0].mSampleRate;
 
     ALOGE("The given camcorder profile param id %d name %s is not found", cameraId, name);
     return -1;

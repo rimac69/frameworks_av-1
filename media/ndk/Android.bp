@@ -63,6 +63,7 @@ ndk_headers {
 }
 
 // for use with header_libs
+// supports use as <media/NdkMediaExtractor.h> not <NdkMediaExtractor.h>
 cc_library_headers {
     name: "media_ndk_headers",
     vendor_available: true,
@@ -85,7 +86,9 @@ cc_library_headers {
 
 cc_library_shared {
     name: "libmediandk",
-    llndk_stubs: "libmediandk.llndk",
+    llndk: {
+        symbol_file: "libmediandk.map.txt",
+    },
 
     srcs: [
         "NdkJavaVMHelper.cpp",
@@ -101,8 +104,6 @@ cc_library_shared {
     ],
 
     include_dirs: [
-        "frameworks/base/core/jni",
-        "frameworks/native/include/media/openmax",
         "system/media/camera/include",
     ],
 
@@ -143,6 +144,7 @@ cc_library_shared {
         "libgui",
         "libui",
         "libmediandk_utils",
+        "android.hardware.drm-V1-ndk",
     ],
 
     export_header_lib_headers: ["jni_headers"],
@@ -165,15 +167,7 @@ cc_library_shared {
     stubs: {
         symbol_file: "libmediandk.map.txt",
         versions: ["29"],
-    },
-}
-
-llndk_library {
-    name: "libmediandk.llndk",
-    symbol_file: "libmediandk.map.txt",
-    export_include_dirs: [
-        "include",
-    ],
+    }
 }
 
 cc_library {
@@ -183,9 +177,8 @@ cc_library {
         "NdkMediaDataSourceCallbacks.cpp",
     ],
 
-    include_dirs: [
-        "frameworks/av/media/libstagefright/include",
-        "frameworks/av/media/ndk/include",
+    local_include_dirs: [
+        "include",
     ],
 
     export_include_dirs: [
@@ -199,7 +192,9 @@ cc_library {
     ],
 
     header_libs: [
+        "libstagefright_headers",
         "libmedia_headers",
+        "libstagefright_headers",
     ],
 
     shared_libs: [
@@ -229,15 +224,13 @@ cc_test {
         "libcutils",
         "android.hardware.graphics.bufferqueue@1.0",
     ],
+
     header_libs: [
         "libstagefright_foundation_headers",
     ],
 
     cflags: [
         "-D__ANDROID_VNDK__",
-    ],
-    include_dirs: [
-        "frameworks/av/media/ndk/",
     ],
 }
 

@@ -50,7 +50,7 @@ cc_fuzz {
         "libbinder",
         "libaudiopolicy",
         "libaudiopolicymanagerdefault",
-        "media_permission-aidl-cpp",
+        "framework-permission-aidl-cpp",
     ],
     static_libs: [
         "android.hardware.audio.common@7.0-enums",
@@ -62,4 +62,7 @@ cc_fuzz {
         "libaudiopolicymanager_interface_headers",
     ],
     data: [":audiopolicyfuzzer_configuration_files"],
+    fuzz_config: {
+       cc: ["mnaganov@google.com"],
+    },
 }

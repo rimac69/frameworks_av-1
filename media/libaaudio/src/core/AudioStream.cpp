@@ -56,16 +56,6 @@ AudioStream::~AudioStream() {
 
     ALOGE_IF(mHasThread, "%s() callback thread never join()ed", __func__);
 
-    if (!mMetricsId.empty()) {
-        android::mediametrics::LogItem(mMetricsId)
-                .set(AMEDIAMETRICS_PROP_EVENT, AMEDIAMETRICS_PROP_EVENT_VALUE_ENDAAUDIOSTREAM)
-                .set(AMEDIAMETRICS_PROP_ENCODINGREQUESTED,
-                     android::toString(mDeviceFormat).c_str())
-                .set(AMEDIAMETRICS_PROP_PERFORMANCEMODEACTUAL,
-                     AudioGlobal_convertPerformanceModeToText(getPerformanceMode()))
-                .record();
-    }
-
     // If the stream is deleted when OPEN or in use then audio resources will leak.
     // This would indicate an internal error. So we want to find this ASAP.
     LOG_ALWAYS_FATAL_IF(!(getState() == AAUDIO_STREAM_STATE_CLOSED
@@ -86,6 +76,7 @@ aaudio_result_t AudioStream::open(const AudioStreamBuilder& builder)
     // Copy parameters from the Builder because the Builder may be deleted after this call.
     // TODO AudioStream should be a subclass of AudioStreamParameters
     mSamplesPerFrame = builder.getSamplesPerFrame();
+    mChannelMask = builder.getChannelMask();
     mSampleRate = builder.getSampleRate();
     mDeviceId = builder.getDeviceId();
     mFormat = builder.getFormat();
@@ -101,6 +92,12 @@ aaudio_result_t AudioStream::open(const AudioStreamBuilder& builder)
     if (mContentType == AAUDIO_UNSPECIFIED) {
         mContentType = AAUDIO_CONTENT_TYPE_MUSIC;
     }
+    mSpatializationBehavior = builder.getSpatializationBehavior();
+    // for consistency with other properties, note UNSPECIFIED is the same as AUTO
+    if (mSpatializationBehavior == AAUDIO_UNSPECIFIED) {
+        mSpatializationBehavior = AAUDIO_SPATIALIZATION_BEHAVIOR_AUTO;
+    }
+    mIsContentSpatialized = builder.isContentSpatialized();
     mInputPreset = builder.getInputPreset();
     if (mInputPreset == AAUDIO_UNSPECIFIED) {
         mInputPreset = AAUDIO_INPUT_PRESET_VOICE_RECOGNITION;
@@ -121,13 +118,13 @@ aaudio_result_t AudioStream::open(const AudioStreamBuilder& builder)
     return AAUDIO_OK;
 }
 
-void AudioStream::logOpen() {
+void AudioStream::logOpenActual() {
     if (mMetricsId.size() > 0) {
         android::mediametrics::LogItem item(mMetricsId);
         item.set(AMEDIAMETRICS_PROP_EVENT, AMEDIAMETRICS_PROP_EVENT_VALUE_OPEN)
-            .set(AMEDIAMETRICS_PROP_PERFORMANCEMODE,
+            .set(AMEDIAMETRICS_PROP_PERFORMANCEMODEACTUAL,
                 AudioGlobal_convertPerformanceModeToText(getPerformanceMode()))
-            .set(AMEDIAMETRICS_PROP_SHARINGMODE,
+            .set(AMEDIAMETRICS_PROP_SHARINGMODEACTUAL,
                 AudioGlobal_convertSharingModeToText(getSharingMode()))
             .set(AMEDIAMETRICS_PROP_BUFFERCAPACITYFRAMES, getBufferCapacity())
             .set(AMEDIAMETRICS_PROP_BURSTFRAMES, getFramesPerBurst())
@@ -359,6 +356,7 @@ void AudioStream::close_l() {
                 .set(AMEDIAMETRICS_PROP_FRAMESTRANSFERRED,
                         getDirection() == AAUDIO_DIRECTION_INPUT ? getFramesWritten()
                                                                  : getFramesRead())
+                .set(AMEDIAMETRICS_PROP_EVENT, AMEDIAMETRICS_PROP_EVENT_VALUE_ENDAAUDIOSTREAM)
                 .record();
     }
 }
@@ -461,8 +459,8 @@ aaudio_result_t AudioStream::createThread_l(int64_t periodNanoseconds,
                                             void* threadArg)
 {
     if (mHasThread) {
-        ALOGE("%s() - mHasThread already true", __func__);
-        return AAUDIO_ERROR_INVALID_STATE;
+        ALOGD("%s() - previous thread was not joined, join now to be safe", __func__);
+        joinThread_l(nullptr);
     }
     if (threadProc == nullptr) {
         return AAUDIO_ERROR_NULL;
@@ -471,6 +469,7 @@ aaudio_result_t AudioStream::createThread_l(int64_t periodNanoseconds,
     mThreadProc = threadProc;
     mThreadArg = threadArg;
     setPeriodNanoseconds(periodNanoseconds);
+    mHasThread = true;
     // Prevent this object from getting deleted before the thread has a chance to create
     // its strong pointer. Assume the thread will call decStrong().
     this->incStrong(nullptr);
@@ -479,6 +478,7 @@ aaudio_result_t AudioStream::createThread_l(int64_t periodNanoseconds,
         android::status_t status = -errno;
         ALOGE("%s() - pthread_create() failed, %d", __func__, status);
         this->decStrong(nullptr); // Because the thread won't do it.
+        mHasThread = false;
         return AAudioConvert_androidToAAudioResult(status);
     } else {
         // TODO Use AAudioThread or maybe AndroidThread
@@ -493,7 +493,6 @@ aaudio_result_t AudioStream::createThread_l(int64_t periodNanoseconds,
         err = pthread_setname_np(mThread, name);
         ALOGW_IF((err != 0), "Could not set name of AAudio thread. err = %d", err);
 
-        mHasThread = true;
         return AAUDIO_OK;
     }
 }
@@ -507,7 +506,7 @@ aaudio_result_t AudioStream::joinThread(void** returnArg) {
 // This must be called under mStreamLock.
 aaudio_result_t AudioStream::joinThread_l(void** returnArg) {
     if (!mHasThread) {
-        ALOGD("joinThread() - but has no thread");
+        ALOGD("joinThread() - but has no thread or already join()ed");
         return AAUDIO_ERROR_INVALID_STATE;
     }
     aaudio_result_t result = AAUDIO_OK;
@@ -524,8 +523,7 @@ aaudio_result_t AudioStream::joinThread_l(void** returnArg) {
             result = AAudioConvert_androidToAAudioResult(-err);
         } else {
             ALOGD("%s() pthread_join succeeded", __func__);
-            // This must be set false so that the callback thread can be created
-            // when the stream is restarted.
+            // Prevent joining a second time, which has undefined behavior.
             mHasThread = false;
         }
     } else {
@@ -604,6 +602,7 @@ bool AudioStream::collidesWithCallback() const {
 
 void AudioStream::setDuckAndMuteVolume(float duckAndMuteVolume) {
     ALOGD("%s() to %f", __func__, duckAndMuteVolume);
+    std::lock_guard<std::mutex> lock(mStreamLock);
     mDuckAndMuteVolume = duckAndMuteVolume;
     doSetVolume(); // apply this change
 }

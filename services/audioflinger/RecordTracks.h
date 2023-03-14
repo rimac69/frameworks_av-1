@@ -15,42 +15,11 @@
 ** limitations under the License.
 */
 
+#include <android/content/AttributionSourceState.h>
+
 #ifndef INCLUDING_FROM_AUDIOFLINGER_H
     #error This header file should only be included from AudioFlinger.h
 #endif
-
-// Checks and monitors OP_RECORD_AUDIO
-class OpRecordAudioMonitor : public RefBase {
-public:
-    ~OpRecordAudioMonitor() override;
-    bool hasOpRecordAudio() const;
-
-    static sp<OpRecordAudioMonitor> createIfNeeded
-        (const media::permission::Identity& identity, const audio_attributes_t& attr);
-
-private:
-    explicit OpRecordAudioMonitor(const media::permission::Identity& identity);
-    void onFirstRef() override;
-
-    AppOpsManager mAppOpsManager;
-
-    class RecordAudioOpCallback : public BnAppOpsCallback {
-    public:
-        explicit RecordAudioOpCallback(const wp<OpRecordAudioMonitor>& monitor);
-        void opChanged(int32_t op, const String16& packageName) override;
-
-    private:
-        const wp<OpRecordAudioMonitor> mMonitor;
-    };
-
-    sp<RecordAudioOpCallback> mOpCallback;
-    // called by RecordAudioOpCallback when OP_RECORD_AUDIO is updated in AppOp callback
-    // and in onFirstRef()
-    void checkRecordAudio();
-
-    std::atomic_bool mHasOpRecordAudio;
-    const media::permission::Identity mIdentity;
-};
 
 // record track
 class RecordTrack : public TrackBase {
@@ -66,11 +35,11 @@ public:
                                 size_t bufferSize,
                                 audio_session_t sessionId,
                                 pid_t creatorPid,
-                                const media::permission::Identity& identity,
+                                const AttributionSourceState& attributionSource,
                                 audio_input_flags_t flags,
                                 track_type type,
                                 audio_port_handle_t portId = AUDIO_PORT_HANDLE_NONE,
-                                int64_t startTimeMs = -1);
+                                int32_t startFrames = -1);
     virtual             ~RecordTrack();
     virtual status_t    initCheck() const;
 
@@ -102,7 +71,7 @@ public:
                                 { return (mFlags & AUDIO_INPUT_FLAG_DIRECT) != 0; }
 
             void        setSilenced(bool silenced) { if (!isPatchTrack()) mSilenced = silenced; }
-            bool        isSilenced() const;
+            bool        isSilenced() const { return mSilenced; }
 
             status_t    getActiveMicrophones(std::vector<media::MicrophoneInfo>* activeMicrophones);
 
@@ -110,13 +79,17 @@ public:
             status_t    setPreferredMicrophoneFieldDimension(float zoom);
             status_t    shareAudioHistory(const std::string& sharedAudioPackageName,
                                           int64_t sharedAudioStartMs);
-            int64_t     startTimeMs() { return mStartTimeMs; }
+            int32_t     startFrames() { return mStartFrames; }
 
     static  bool        checkServerLatencySupported(
                                 audio_format_t format, audio_input_flags_t flags) {
                             return audio_is_linear_pcm(format)
                                     && (flags & AUDIO_INPUT_FLAG_HW_AV_SYNC) == 0;
                         }
+
+            using SinkMetadatas = std::vector<record_track_metadata_v7_t>;
+            using MetadataInserter = std::back_insert_iterator<SinkMetadatas>;
+            virtual void    copyMetadataTo(MetadataInserter& backInserter) const;
 
 private:
     friend class AudioFlinger;  // for mState
@@ -149,10 +122,8 @@ private:
 
             bool                               mSilenced;
 
-            // used to enforce OP_RECORD_AUDIO
-            sp<OpRecordAudioMonitor>           mOpRecordAudioMonitor;
             std::string                        mSharedAudioPackageName = {};
-            int64_t                            mStartTimeMs = -1;
+            int32_t                            mStartFrames = -1;
 };
 
 // playback track, used by PatchPanel
@@ -167,7 +138,8 @@ public:
                 void *buffer,
                 size_t bufferSize,
                 audio_input_flags_t flags,
-                const Timeout& timeout = {});
+                const Timeout& timeout = {},
+                audio_source_t source = AUDIO_SOURCE_DEFAULT);
     virtual             ~PatchRecord();
 
     virtual Source* getSource() { return nullptr; }
@@ -199,7 +171,8 @@ public:
                         audio_channel_mask_t channelMask,
                         audio_format_t format,
                         size_t frameCount,
-                        audio_input_flags_t flags);
+                        audio_input_flags_t flags,
+                        audio_source_t source = AUDIO_SOURCE_DEFAULT);
 
     Source* getSource() override { return static_cast<Source*>(this); }
 

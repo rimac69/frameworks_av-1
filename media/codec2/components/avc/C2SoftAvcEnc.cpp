@@ -28,6 +28,7 @@
 #include <media/stagefright/foundation/AUtils.h>
 
 #include <C2Debug.h>
+#include <Codec2Mapper.h>
 #include <C2PlatformSupport.h>
 #include <Codec2BufferUtils.h>
 #include <SimpleC2Interface.h>
@@ -213,6 +214,42 @@ public:
                 .withFields({C2F(mSyncFramePeriod, value).any()})
                 .withSetter(Setter<decltype(*mSyncFramePeriod)>::StrictValueWithNoDeps)
                 .build());
+
+        addParameter(
+                DefineParam(mColorAspects, C2_PARAMKEY_COLOR_ASPECTS)
+                .withDefault(new C2StreamColorAspectsInfo::input(
+                        0u, C2Color::RANGE_UNSPECIFIED, C2Color::PRIMARIES_UNSPECIFIED,
+                        C2Color::TRANSFER_UNSPECIFIED, C2Color::MATRIX_UNSPECIFIED))
+                .withFields({
+                    C2F(mColorAspects, range).inRange(
+                                C2Color::RANGE_UNSPECIFIED,     C2Color::RANGE_OTHER),
+                    C2F(mColorAspects, primaries).inRange(
+                                C2Color::PRIMARIES_UNSPECIFIED, C2Color::PRIMARIES_OTHER),
+                    C2F(mColorAspects, transfer).inRange(
+                                C2Color::TRANSFER_UNSPECIFIED,  C2Color::TRANSFER_OTHER),
+                    C2F(mColorAspects, matrix).inRange(
+                                C2Color::MATRIX_UNSPECIFIED,    C2Color::MATRIX_OTHER)
+                })
+                .withSetter(ColorAspectsSetter)
+                .build());
+
+        addParameter(
+                DefineParam(mCodedColorAspects, C2_PARAMKEY_VUI_COLOR_ASPECTS)
+                .withDefault(new C2StreamColorAspectsInfo::output(
+                        0u, C2Color::RANGE_LIMITED, C2Color::PRIMARIES_UNSPECIFIED,
+                        C2Color::TRANSFER_UNSPECIFIED, C2Color::MATRIX_UNSPECIFIED))
+                .withFields({
+                    C2F(mCodedColorAspects, range).inRange(
+                                C2Color::RANGE_UNSPECIFIED,     C2Color::RANGE_OTHER),
+                    C2F(mCodedColorAspects, primaries).inRange(
+                                C2Color::PRIMARIES_UNSPECIFIED, C2Color::PRIMARIES_OTHER),
+                    C2F(mCodedColorAspects, transfer).inRange(
+                                C2Color::TRANSFER_UNSPECIFIED,  C2Color::TRANSFER_OTHER),
+                    C2F(mCodedColorAspects, matrix).inRange(
+                                C2Color::MATRIX_UNSPECIFIED,    C2Color::MATRIX_OTHER)
+                })
+                .withSetter(CodedColorAspectsSetter, mColorAspects)
+                .build());
     }
 
     static C2R InputDelaySetter(
@@ -356,6 +393,88 @@ public:
                                          C2P<C2StreamPictureQuantizationTuning::output> &me) {
         (void)mayBlock;
         (void)me;
+
+        // TODO: refactor with same algorithm in the SetQp()
+        int32_t iMin = DEFAULT_I_QP_MIN, pMin = DEFAULT_P_QP_MIN, bMin = DEFAULT_B_QP_MIN;
+        int32_t iMax = DEFAULT_I_QP_MAX, pMax = DEFAULT_P_QP_MAX, bMax = DEFAULT_B_QP_MAX;
+
+        for (size_t i = 0; i < me.v.flexCount(); ++i) {
+            const C2PictureQuantizationStruct &layer = me.v.m.values[i];
+
+            if (layer.type_ == C2Config::picture_type_t(I_FRAME)) {
+                iMax = layer.max;
+                iMin = layer.min;
+                ALOGV("iMin %d iMax %d", iMin, iMax);
+            } else if (layer.type_ == C2Config::picture_type_t(P_FRAME)) {
+                pMax = layer.max;
+                pMin = layer.min;
+                ALOGV("pMin %d pMax %d", pMin, pMax);
+            } else if (layer.type_ == C2Config::picture_type_t(B_FRAME)) {
+                bMax = layer.max;
+                bMin = layer.min;
+                ALOGV("bMin %d bMax %d", bMin, bMax);
+            }
+        }
+
+        ALOGV("PictureQuantizationSetter(entry): i %d-%d p %d-%d b %d-%d",
+              iMin, iMax, pMin, pMax, bMin, bMax);
+
+        // ensure we have legal values
+        iMax = std::clamp(iMax, CODEC_QP_MIN, CODEC_QP_MAX);
+        iMin = std::clamp(iMin, CODEC_QP_MIN, CODEC_QP_MAX);
+        pMax = std::clamp(pMax, CODEC_QP_MIN, CODEC_QP_MAX);
+        pMin = std::clamp(pMin, CODEC_QP_MIN, CODEC_QP_MAX);
+        bMax = std::clamp(bMax, CODEC_QP_MIN, CODEC_QP_MAX);
+        bMin = std::clamp(bMin, CODEC_QP_MIN, CODEC_QP_MAX);
+
+        // put them back into the structure
+        for (size_t i = 0; i < me.v.flexCount(); ++i) {
+            const C2PictureQuantizationStruct &layer = me.v.m.values[i];
+
+            if (layer.type_ == C2Config::picture_type_t(I_FRAME)) {
+                me.set().m.values[i].max = iMax;
+                me.set().m.values[i].min = iMin;
+            }
+            if (layer.type_ == C2Config::picture_type_t(P_FRAME)) {
+                me.set().m.values[i].max = pMax;
+                me.set().m.values[i].min = pMin;
+            }
+            if (layer.type_ == C2Config::picture_type_t(B_FRAME)) {
+                me.set().m.values[i].max = bMax;
+                me.set().m.values[i].min = bMin;
+            }
+        }
+
+        ALOGV("PictureQuantizationSetter(exit): i %d-%d p %d-%d b %d-%d",
+              iMin, iMax, pMin, pMax, bMin, bMax);
+
+        return C2R::Ok();
+    }
+
+    static C2R ColorAspectsSetter(bool mayBlock, C2P<C2StreamColorAspectsInfo::input> &me) {
+        (void)mayBlock;
+        if (me.v.range > C2Color::RANGE_OTHER) {
+                me.set().range = C2Color::RANGE_OTHER;
+        }
+        if (me.v.primaries > C2Color::PRIMARIES_OTHER) {
+                me.set().primaries = C2Color::PRIMARIES_OTHER;
+        }
+        if (me.v.transfer > C2Color::TRANSFER_OTHER) {
+                me.set().transfer = C2Color::TRANSFER_OTHER;
+        }
+        if (me.v.matrix > C2Color::MATRIX_OTHER) {
+                me.set().matrix = C2Color::MATRIX_OTHER;
+        }
+        return C2R::Ok();
+    }
+
+    static C2R CodedColorAspectsSetter(bool mayBlock, C2P<C2StreamColorAspectsInfo::output> &me,
+                                       const C2P<C2StreamColorAspectsInfo::input> &coded) {
+        (void)mayBlock;
+        me.set().range = coded.v.range;
+        me.set().primaries = coded.v.primaries;
+        me.set().transfer = coded.v.transfer;
+        me.set().matrix = coded.v.matrix;
         return C2R::Ok();
     }
 
@@ -418,6 +537,9 @@ public:
     std::shared_ptr<C2StreamGopTuning::output> getGop_l() const { return mGop; }
     std::shared_ptr<C2StreamPictureQuantizationTuning::output> getPictureQuantization_l() const
     { return mPictureQuantization; }
+    std::shared_ptr<C2StreamColorAspectsInfo::output> getCodedColorAspects_l() const {
+        return mCodedColorAspects;
+    }
 
 private:
     std::shared_ptr<C2StreamUsageTuning::input> mUsage;
@@ -430,6 +552,8 @@ private:
     std::shared_ptr<C2StreamSyncFrameIntervalTuning::output> mSyncFramePeriod;
     std::shared_ptr<C2StreamGopTuning::output> mGop;
     std::shared_ptr<C2StreamPictureQuantizationTuning::output> mPictureQuantization;
+    std::shared_ptr<C2StreamColorAspectsInfo::input> mColorAspects;
+    std::shared_ptr<C2StreamColorAspectsInfo::output> mCodedColorAspects;
 };
 
 #define ive_api_function  ih264e_api_function
@@ -532,8 +656,7 @@ void  C2SoftAvcEnc::initEncParams() {
     mEntropyMode = DEFAULT_ENTROPY_MODE;
     mBframes = DEFAULT_B_FRAMES;
 
-    gettimeofday(&mTimeStart, nullptr);
-    gettimeofday(&mTimeEnd, nullptr);
+    mTimeStart = mTimeEnd = systemTime();
 }
 
 c2_status_t C2SoftAvcEnc::setDimensions() {
@@ -696,10 +819,11 @@ c2_status_t C2SoftAvcEnc::setQp() {
     s_qp_ip.e_cmd = IVE_CMD_VIDEO_CTL;
     s_qp_ip.e_sub_cmd = IVE_CMD_CTL_SET_QP;
 
-    // these are the ones we're going to set, so want them to default ....
-    // to the DEFAULT values for the codec instea dof CODEC_ bounding
-    int32_t iMin = INT32_MIN, pMin = INT32_MIN, bMin = INT32_MIN;
-    int32_t iMax = INT32_MAX, pMax = INT32_MAX, bMax = INT32_MAX;
+    // TODO: refactor with same algorithm in the PictureQuantizationSetter()
+    int32_t iMin = DEFAULT_I_QP_MIN, pMin = DEFAULT_P_QP_MIN, bMin = DEFAULT_B_QP_MIN;
+    int32_t iMax = DEFAULT_I_QP_MAX, pMax = DEFAULT_P_QP_MAX, bMax = DEFAULT_B_QP_MAX;
+
+    IntfImpl::Lock lock = mIntf->lock();
 
     std::shared_ptr<C2StreamPictureQuantizationTuning::output> qp =
                     mIntf->getPictureQuantization_l();
@@ -721,22 +845,6 @@ c2_status_t C2SoftAvcEnc::setQp() {
         }
     }
 
-    // INT32_{MIN,MAX} means unspecified, so use the codec's default
-    if (iMax == INT32_MAX) iMax = DEFAULT_I_QP_MAX;
-    if (iMin == INT32_MIN) iMin = DEFAULT_I_QP_MIN;
-    if (pMax == INT32_MAX) pMax = DEFAULT_P_QP_MAX;
-    if (pMin == INT32_MIN) pMin = DEFAULT_P_QP_MIN;
-    if (bMax == INT32_MAX) bMax = DEFAULT_B_QP_MAX;
-    if (bMin == INT32_MIN) bMin = DEFAULT_B_QP_MIN;
-
-    // ensure we have legal values
-    iMax = std::clamp(iMax, CODEC_QP_MIN, CODEC_QP_MAX);
-    iMin = std::clamp(iMin, CODEC_QP_MIN, CODEC_QP_MAX);
-    pMax = std::clamp(pMax, CODEC_QP_MIN, CODEC_QP_MAX);
-    pMin = std::clamp(pMin, CODEC_QP_MIN, CODEC_QP_MAX);
-    bMax = std::clamp(bMax, CODEC_QP_MIN, CODEC_QP_MAX);
-    bMin = std::clamp(bMin, CODEC_QP_MIN, CODEC_QP_MAX);
-
     s_qp_ip.u4_i_qp_max = iMax;
     s_qp_ip.u4_i_qp_min = iMin;
     s_qp_ip.u4_p_qp_max = pMax;
@@ -749,7 +857,7 @@ c2_status_t C2SoftAvcEnc::setQp() {
     s_qp_ip.u4_p_qp = std::clamp(DEFAULT_P_QP, pMin, pMax);
     s_qp_ip.u4_b_qp = std::clamp(DEFAULT_B_QP, bMin, bMax);
 
-    ALOGV("setting QP: i %d-%d p %d-%d b %d-%d", iMin, iMax, pMin, pMax, bMin, bMax);
+    ALOGV("setQp(): i %d-%d p %d-%d b %d-%d", iMin, iMax, pMin, pMax, bMin, bMax);
 
 
     s_qp_ip.u4_timestamp_high = -1;
@@ -980,6 +1088,55 @@ void C2SoftAvcEnc::logVersion() {
     return;
 }
 
+c2_status_t C2SoftAvcEnc::setVuiParams()
+{
+    ColorAspects sfAspects;
+    if (!C2Mapper::map(mColorAspects->primaries, &sfAspects.mPrimaries)) {
+        sfAspects.mPrimaries = android::ColorAspects::PrimariesUnspecified;
+    }
+    if (!C2Mapper::map(mColorAspects->range, &sfAspects.mRange)) {
+        sfAspects.mRange = android::ColorAspects::RangeUnspecified;
+    }
+    if (!C2Mapper::map(mColorAspects->matrix, &sfAspects.mMatrixCoeffs)) {
+        sfAspects.mMatrixCoeffs = android::ColorAspects::MatrixUnspecified;
+    }
+    if (!C2Mapper::map(mColorAspects->transfer, &sfAspects.mTransfer)) {
+        sfAspects.mTransfer = android::ColorAspects::TransferUnspecified;
+    }
+    int32_t primaries, transfer, matrixCoeffs;
+    bool range;
+    ColorUtils::convertCodecColorAspectsToIsoAspects(sfAspects,
+            &primaries,
+            &transfer,
+            &matrixCoeffs,
+            &range);
+    ih264e_vui_ip_t s_vui_params_ip {};
+    ih264e_vui_op_t s_vui_params_op {};
+
+    s_vui_params_ip.e_cmd = IVE_CMD_VIDEO_CTL;
+    s_vui_params_ip.e_sub_cmd = IVE_CMD_CTL_SET_VUI_PARAMS;
+
+    s_vui_params_ip.u1_video_signal_type_present_flag = 1;
+    s_vui_params_ip.u1_colour_description_present_flag = 1;
+    s_vui_params_ip.u1_colour_primaries = primaries;
+    s_vui_params_ip.u1_transfer_characteristics = transfer;
+    s_vui_params_ip.u1_matrix_coefficients = matrixCoeffs;
+    s_vui_params_ip.u1_video_full_range_flag = range;
+
+    s_vui_params_ip.u4_size = sizeof(ih264e_vui_ip_t);
+    s_vui_params_op.u4_size = sizeof(ih264e_vui_op_t);
+
+    IV_STATUS_T status = ih264e_api_function(mCodecCtx, &s_vui_params_ip,
+                                             &s_vui_params_op);
+    if(status != IV_SUCCESS)
+    {
+        ALOGE("Unable to set vui params = 0x%x\n",
+                s_vui_params_op.u4_error_code);
+        return C2_CORRUPTED;
+    }
+    return C2_OK;
+}
+
 c2_status_t C2SoftAvcEnc::initEncoder() {
     IV_STATUS_T status;
     WORD32 level;
@@ -999,6 +1156,7 @@ c2_status_t C2SoftAvcEnc::initEncoder() {
         mIInterval = mIntf->getSyncFramePeriod_l();
         mIDRInterval = mIntf->getSyncFramePeriod_l();
         gop = mIntf->getGop_l();
+        mColorAspects = mIntf->getCodedColorAspects_l();
     }
     if (gop && gop->flexCount() > 0) {
         uint32_t syncInterval = 1;
@@ -1223,6 +1381,9 @@ c2_status_t C2SoftAvcEnc::initEncoder() {
     /* Video control Set Profile params */
     setProfileParams();
 
+    /* Video control Set VUI params */
+    setVuiParams();
+
     /* Video control Set in Encode header mode */
     setEncMode(IVE_ENC_MODE_HEADER);
 
@@ -1353,7 +1514,8 @@ c2_status_t C2SoftAvcEnc::setEncodeArgs(
             vPlane = uPlane + yPlaneSize / 4;
             yStride = width;
             uStride = vStride = yStride / 2;
-            ConvertRGBToPlanarYUV(yPlane, yStride, height, conversionBuffer.size(), *input);
+            ConvertRGBToPlanarYUV(yPlane, yStride, height, conversionBuffer.size(), *input,
+                                  mColorAspects->matrix, mColorAspects->range);
             break;
         }
         case C2PlanarLayout::TYPE_YUV: {
@@ -1488,8 +1650,7 @@ void C2SoftAvcEnc::process(
     work->worklets.front()->output.flags = work->input.flags;
 
     IV_STATUS_T status;
-    WORD32 timeDelay = 0;
-    WORD32 timeTaken = 0;
+    nsecs_t timeDelay = 0;
     uint64_t workIndex = work->input.ordinal.frameIndex.peekull();
 
     // Initialize encoder if not already initialized
@@ -1655,10 +1816,10 @@ void C2SoftAvcEnc::process(
         //         mInFile, s_encode_ip.s_inp_buf.apv_bufs[0],
         //         (mHeight * mStride * 3 / 2));
 
-        GETTIME(&mTimeStart, nullptr);
         /* Compute time elapsed between end of previous decode()
          * to start of current decode() */
-        TIME_DIFF(mTimeEnd, mTimeStart, timeDelay);
+        mTimeStart = systemTime();
+        timeDelay = mTimeStart - mTimeEnd;
         status = ive_api_function(mCodecCtx, &s_video_encode_ip, &s_video_encode_op);
 
         if (IV_SUCCESS != status) {
@@ -1682,11 +1843,11 @@ void C2SoftAvcEnc::process(
         mBuffers[ps_encode_ip->s_inp_buf.apv_bufs[0]] = inputBuffer;
     }
 
-    GETTIME(&mTimeEnd, nullptr);
     /* Compute time taken for decode() */
-    TIME_DIFF(mTimeStart, mTimeEnd, timeTaken);
+    mTimeEnd = systemTime();
+    nsecs_t timeTaken = mTimeEnd - mTimeStart;
 
-    ALOGV("timeTaken=%6d delay=%6d numBytes=%6d", timeTaken, timeDelay,
+    ALOGV("timeTaken=%" PRId64 "d delay=%" PRId64 " numBytes=%6d", timeTaken, timeDelay,
             ps_encode_op->s_out_buf.u4_bytes);
 
     void *freed = ps_encode_op->s_inp_buf.apv_bufs[0];

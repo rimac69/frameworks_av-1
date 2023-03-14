@@ -115,7 +115,7 @@ void NuPlayer::RTPSource::prepareAsync() {
 
         int sockRtp, sockRtcp;
         ARTPConnection::MakeRTPSocketPair(&sockRtp, &sockRtcp, info->mLocalIp, info->mRemoteIp,
-                info->mLocalPort, info->mRemotePort, info->mSocketNetwork);
+                info->mLocalPort, info->mRemotePort, info->mSocketNetwork, info->mRtpSockOptEcn);
 
         sp<AMessage> notify = new AMessage('accu', this);
 
@@ -124,8 +124,18 @@ void NuPlayer::RTPSource::prepareAsync() {
         // index(i) should be started from 1. 0 is reserved for [root]
         mRTPConn->addStream(sockRtp, sockRtcp, desc, i + 1, notify, false);
         mRTPConn->setSelfID(info->mSelfID);
-        mRTPConn->setJbTime(
-                (info->mJbTimeMs <= 3000 && info->mJbTimeMs >= 40) ? info->mJbTimeMs : 300);
+        mRTPConn->setStaticJitterTimeMs(info->mJbTimeMs);
+        mRTPConn->setRtpSockOptEcn(info->mRtpSockOptEcn);
+        mRTPConn->setIsIPv6(info->mLocalIp);
+
+        unsigned long PT;
+        AString formatDesc, formatParams;
+        // index(i) should be started from 1. 0 is reserved for [root]
+        desc->getFormatType(i + 1, &PT, &formatDesc, &formatParams);
+
+        int32_t clockRate, numChannels;
+        ASessionDescription::ParseFormatDesc(formatDesc.c_str(), &clockRate, &numChannels);
+        info->mTimeScale = clockRate;
 
         info->mRTPSocket = sockRtp;
         info->mRTCPSocket = sockRtcp;
@@ -146,10 +156,8 @@ void NuPlayer::RTPSource::prepareAsync() {
 
         if (info->mIsAudio) {
             mAudioTrack = source;
-            info->mTimeScale = 16000;
         } else {
             mVideoTrack = source;
-            info->mTimeScale = 90000;
         }
 
         info->mSource = source;
@@ -330,7 +338,7 @@ status_t NuPlayer::RTPSource::getDuration(int64_t *durationUs) {
     *durationUs = 0ll;
 
     int64_t audioDurationUs;
-    if (mAudioTrack != NULL
+    if (mAudioTrack != NULL && mAudioTrack->getFormat() != NULL
             && mAudioTrack->getFormat()->findInt64(
                 kKeyDuration, &audioDurationUs)
             && audioDurationUs > *durationUs) {
@@ -338,7 +346,7 @@ status_t NuPlayer::RTPSource::getDuration(int64_t *durationUs) {
     }
 
     int64_t videoDurationUs;
-    if (mVideoTrack != NULL
+    if (mVideoTrack != NULL && mVideoTrack->getFormat() != NULL
             && mVideoTrack->getFormat()->findInt64(
                 kKeyDuration, &videoDurationUs)
             && videoDurationUs > *durationUs) {
@@ -389,23 +397,13 @@ void NuPlayer::RTPSource::onMessageReceived(const sp<AMessage> &msg) {
                 CHECK(msg->findInt64("ntp-time", (int64_t *)&ntpTime));
 
                 onTimeUpdate(trackIndex, rtpTime, ntpTime);
-                break;
-            }
-
-            int32_t firstRTCP;
-            if (msg->findInt32("first-rtcp", &firstRTCP)) {
-                // There won't be an access unit here, it's just a notification
-                // that the data communication worked since we got the first
-                // rtcp packet.
-                ALOGV("first-rtcp");
-                break;
             }
 
             int32_t IMSRxNotice;
             if (msg->findInt32("rtcp-event", &IMSRxNotice)) {
-                int32_t payloadType, feedbackType;
+                int32_t payloadType = 0, feedbackType = 0;
                 CHECK(msg->findInt32("payload-type", &payloadType));
-                CHECK(msg->findInt32("feedback-type", &feedbackType));
+                msg->findInt32("feedback-type", &feedbackType);
 
                 sp<AMessage> notify = dupNotify();
                 notify->setInt32("what", kWhatIMSRxNotice);
@@ -680,7 +678,7 @@ status_t NuPlayer::RTPSource::setParameter(const String8 &key, const String8 &va
         newTrackInfo.mIsAudio = isAudioKey;
         mTracks.push(newTrackInfo);
         info = &mTracks.editTop();
-        info->mJbTimeMs = 300;
+        info->mJbTimeMs = kStaticJitterTimeMs;
     }
 
     if (key == "rtp-param-mime-type") {
@@ -723,8 +721,11 @@ status_t NuPlayer::RTPSource::setParameter(const String8 &key, const String8 &va
     } else if (key == "rtp-param-set-socket-network") {
         int64_t networkHandle = atoll(value);
         setSocketNetwork(networkHandle);
+    } else if (key == "rtp-param-set-socket-ecn") {
+        info->mRtpSockOptEcn = atoi(value);
     } else if (key == "rtp-param-jitter-buffer-time") {
-        info->mJbTimeMs = atoi(value);
+        // clamping min at 40, max at 3000
+        info->mJbTimeMs = std::min(std::max(40, atoi(value)), 3000);
     }
 
     return OK;

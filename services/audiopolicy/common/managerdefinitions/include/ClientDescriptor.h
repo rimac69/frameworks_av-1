@@ -16,19 +16,21 @@
 
 #pragma once
 
-#include <vector>
-#include <map>
-#include <unistd.h>
 #include <sys/types.h>
+#include <unistd.h>
 
-#include <system/audio.h>
+#include <map>
+#include <vector>
+
+#include <android-base/stringprintf.h>
 #include <audiomanager/AudioManager.h>
 #include <media/AudioProductStrategy.h>
+#include <policy.h>
+#include <system/audio.h>
 #include <utils/Errors.h>
 #include <utils/KeyedVector.h>
 #include <utils/RefBase.h>
 #include <utils/String8.h>
-#include <policy.h>
 #include <Volume.h>
 #include "AudioPatch.h"
 #include "EffectDescriptor.h"
@@ -52,9 +54,15 @@ public:
         mPreferredDeviceForExclusiveUse(isPreferredDeviceForExclusiveUse){}
     ~ClientDescriptor() override = default;
 
-    virtual void dump(String8 *dst, int spaces, int index) const;
+    virtual void dump(String8 *dst, int spaces) const;
     virtual std::string toShortString() const;
-
+    /**
+     * @brief isInternal
+     * @return true if the client corresponds to an audio patch created from createAudioPatch API or
+     * for call audio routing, or false if the client corresponds to an AudioTrack, AudioRecord or
+     * HW Audio Source.
+     */
+    virtual bool isInternal() const { return false; }
     audio_port_handle_t portId() const { return mPortId; }
     uid_t uid() const { return mUid; }
     audio_session_t session() const { return mSessionId; };
@@ -67,8 +75,16 @@ public:
     bool isPreferredDeviceForExclusiveUse() const { return mPreferredDeviceForExclusiveUse; }
     virtual void setActive(bool active) { mActive = active; }
     bool active() const { return mActive; }
+    /**
+     * @brief hasPreferredDevice Note that as internal clients use preferred device for convenience,
+     * we do hide this internal behavior to prevent from regression (like invalidating track for
+     * clients following same strategies...)
+     * @param activeOnly
+     * @return
+     */
     bool hasPreferredDevice(bool activeOnly = false) const {
-        return mPreferredDeviceId != AUDIO_PORT_HANDLE_NONE && (!activeOnly || mActive);
+        return !isInternal() &&
+                mPreferredDeviceId != AUDIO_PORT_HANDLE_NONE && (!activeOnly || mActive);
     }
 
 private:
@@ -100,7 +116,7 @@ public:
     ~TrackClientDescriptor() override = default;
 
     using ClientDescriptor::dump;
-    void dump(String8 *dst, int spaces, int index) const override;
+    void dump(String8 *dst, int spaces) const override;
     std::string toShortString() const override;
 
     audio_output_flags_t flags() const { return mFlags; }
@@ -109,6 +125,9 @@ public:
     const std::vector<wp<SwAudioOutputDescriptor>>& getSecondaryOutputs() const {
         return mSecondaryOutputs;
     };
+    void setSecondaryOutputs(std::vector<wp<SwAudioOutputDescriptor>>&& secondaryOutputs) {
+        mSecondaryOutputs = std::move(secondaryOutputs);
+    }
     VolumeSource volumeSource() const { return mVolumeSource; }
     const sp<AudioPolicyMix> getPrimaryMix() const {
         return mPrimaryMix.promote();
@@ -138,18 +157,27 @@ public:
     }
     uint32_t getActivityCount() const { return mActivityCount; }
 
+    bool isInvalid() const {
+        return mIsInvalid;
+    }
+
+    void setIsInvalid() {
+        mIsInvalid = true;
+    }
+
 private:
     const audio_stream_type_t mStream;
     const product_strategy_t mStrategy;
     const VolumeSource mVolumeSource;
     const audio_output_flags_t mFlags;
-    const std::vector<wp<SwAudioOutputDescriptor>> mSecondaryOutputs;
+    std::vector<wp<SwAudioOutputDescriptor>> mSecondaryOutputs;
     const wp<AudioPolicyMix> mPrimaryMix;
     /**
      * required for duplicating thread, prevent from removing active client from an output
      * involved in a duplication.
      */
     uint32_t mActivityCount = 0;
+    bool mIsInvalid = false;
 };
 
 class RecordClientDescriptor: public ClientDescriptor
@@ -165,7 +193,7 @@ public:
     ~RecordClientDescriptor() override = default;
 
     using ClientDescriptor::dump;
-    void dump(String8 *dst, int spaces, int index) const override;
+    void dump(String8 *dst, int spaces) const override;
 
     audio_unique_id_t riid() const { return mRIId; }
     audio_source_t source() const { return mSource; }
@@ -206,17 +234,23 @@ public:
         mPatchHandle = AUDIO_PATCH_HANDLE_NONE;
         mSinkDevice = nullptr;
     }
+    bool belongsToOutput(const sp<SwAudioOutputDescriptor> &swOutput) const {
+        return swOutput != nullptr && mSwOutput.promote() == swOutput;
+    }
+    void setUseSwBridge() { mUseSwBridge = true; }
+    bool useSwBridge() const { return mUseSwBridge; }
+    bool canCloseOutput() const { return mCloseOutput; }
     bool isConnected() const { return mPatchHandle != AUDIO_PATCH_HANDLE_NONE; }
     audio_patch_handle_t getPatchHandle() const { return mPatchHandle; }
     sp<DeviceDescriptor> srcDevice() const { return mSrcDevice; }
     sp<DeviceDescriptor> sinkDevice() const { return mSinkDevice; }
     wp<SwAudioOutputDescriptor> swOutput() const { return mSwOutput; }
-    void setSwOutput(const sp<SwAudioOutputDescriptor>& swOutput);
+    void setSwOutput(const sp<SwAudioOutputDescriptor>& swOutput, bool closeOutput = false);
     wp<HwAudioOutputDescriptor> hwOutput() const { return mHwOutput; }
     void setHwOutput(const sp<HwAudioOutputDescriptor>& hwOutput);
 
     using ClientDescriptor::dump;
-    void dump(String8 *dst, int spaces, int index) const override;
+    void dump(String8 *dst, int spaces) const override;
 
  private:
     audio_patch_handle_t mPatchHandle = AUDIO_PATCH_HANDLE_NONE;
@@ -224,6 +258,44 @@ public:
     sp<DeviceDescriptor> mSinkDevice;
     wp<SwAudioOutputDescriptor> mSwOutput;
     wp<HwAudioOutputDescriptor> mHwOutput;
+    bool mUseSwBridge = false;
+    /**
+     * For either HW bridge associated to a SwOutput for activity / volume or SwBridge for also
+     * sample rendering / activity & volume, an existing playback thread may be reused (e.g.
+     * not already opened at APM startup or Direct Output).
+     * If reusing an already opened output, when this output is not used anymore, the AudioFlinger
+     * patch must be updated to refine the output device(s) information and ensure the right
+     * behavior of AudioDeviceCallback.
+     */
+    bool mCloseOutput = false;
+};
+
+/**
+ * @brief The InternalSourceClientDescriptor class
+ * Specialized Client Descriptor for either a raw patch created from @see createAudioPatch API
+ * or for internal audio patches managed by APM (e.g. phone call patches).
+ * Whatever the bridge created (software or hardware), we need a client to track the activity
+ * and manage volumes.
+ * The Audio Patch requested sink is expressed as a preferred device which allows to route
+ * the SwOutput. Then APM will performs checks on the UID (against UID of Audioserver) of the
+ * requester to prevent rerouting SwOutput involved in raw patches.
+ */
+class InternalSourceClientDescriptor: public SourceClientDescriptor
+{
+public:
+    InternalSourceClientDescriptor(
+            audio_port_handle_t portId, uid_t uid, audio_attributes_t attributes,
+            const struct audio_port_config &config, const sp<DeviceDescriptor>& srcDevice,
+             const sp<DeviceDescriptor>& sinkDevice,
+            product_strategy_t strategy, VolumeSource volumeSource) :
+        SourceClientDescriptor(
+            portId, uid, attributes, config, srcDevice, AUDIO_STREAM_PATCH, strategy,
+            volumeSource)
+    {
+        setPreferredDeviceId(sinkDevice->getId());
+    }
+    bool isInternal() const override { return true; }
+    ~InternalSourceClientDescriptor() override = default;
 };
 
 class SourceClientCollection :
@@ -266,10 +338,13 @@ public:
     size_t getClientCount() const {
         return mClients.size();
     }
-    virtual void dump(String8 *dst) const {
+    virtual void dump(String8 *dst, int spaces, const char* extraInfo = nullptr) const {
+        (void)extraInfo;
         size_t index = 0;
         for (const auto& client: getClientIterable()) {
-            client->dump(dst, 2, index++);
+            const std::string prefix = base::StringPrintf("%*s %zu. ", spaces, "", ++index);
+            dst->appendFormat("%s", prefix.c_str());
+            client->dump(dst, prefix.size());
         }
     }
 

@@ -31,6 +31,7 @@
 #include <sys/resource.h>
 #include <thread>
 
+#include <android-base/stringprintf.h>
 #include <android/media/IAudioPolicyService.h>
 #include <android/os/IExternalVibratorService.h>
 #include <binder/IPCThreadState.h>
@@ -57,6 +58,7 @@
 
 #include "AudioFlinger.h"
 #include "NBAIO_Tee.h"
+#include "PropertyUtils.h"
 
 #include <media/AudioResamplerPublic.h>
 
@@ -64,6 +66,7 @@
 #include <system/audio_effects/effect_ns.h>
 #include <system/audio_effects/effect_aec.h>
 #include <system/audio_effects/effect_hapticgenerator.h>
+#include <system/audio_effects/effect_spatializer.h>
 
 #include <audio_utils/primitives.h>
 
@@ -76,6 +79,7 @@
 #include <media/nbaio/PipeReader.h>
 #include <mediautils/BatteryNotifier.h>
 #include <mediautils/MemoryLeakTrackUtil.h>
+#include <mediautils/MethodStatistics.h>
 #include <mediautils/ServiceUtilities.h>
 #include <mediautils/TimeCheck.h>
 #include <private/android_filesystem_config.h>
@@ -102,8 +106,13 @@
 
 namespace android {
 
+#define MAX_AAUDIO_PROPERTY_DEVICE_HAL_VERSION 7.1
+
+using ::android::base::StringPrintf;
 using media::IEffectClient;
-using media::permission::Identity;
+using media::audio::common::AudioMMapPolicyInfo;
+using media::audio::common::AudioMMapPolicyType;
+using android::content::AttributionSourceState;
 
 static const char kDeadlockedString[] = "AudioFlinger may be deadlocked\n";
 static const char kHardwareLockedString[] = "Hardware lock is taken\n";
@@ -150,6 +159,95 @@ static sp<os::IExternalVibratorService> getExternalVibratorService() {
     return sExternalVibratorService;
 }
 
+// Creates association between Binder code to name for IAudioFlinger.
+#define IAUDIOFLINGER_BINDER_METHOD_MACRO_LIST \
+BINDER_METHOD_ENTRY(createTrack) \
+BINDER_METHOD_ENTRY(createRecord) \
+BINDER_METHOD_ENTRY(sampleRate) \
+BINDER_METHOD_ENTRY(format) \
+BINDER_METHOD_ENTRY(frameCount) \
+BINDER_METHOD_ENTRY(latency) \
+BINDER_METHOD_ENTRY(setMasterVolume) \
+BINDER_METHOD_ENTRY(setMasterMute) \
+BINDER_METHOD_ENTRY(masterVolume) \
+BINDER_METHOD_ENTRY(masterMute) \
+BINDER_METHOD_ENTRY(setStreamVolume) \
+BINDER_METHOD_ENTRY(setStreamMute) \
+BINDER_METHOD_ENTRY(streamVolume) \
+BINDER_METHOD_ENTRY(streamMute) \
+BINDER_METHOD_ENTRY(setMode) \
+BINDER_METHOD_ENTRY(setMicMute) \
+BINDER_METHOD_ENTRY(getMicMute) \
+BINDER_METHOD_ENTRY(setRecordSilenced) \
+BINDER_METHOD_ENTRY(setParameters) \
+BINDER_METHOD_ENTRY(getParameters) \
+BINDER_METHOD_ENTRY(registerClient) \
+BINDER_METHOD_ENTRY(getInputBufferSize) \
+BINDER_METHOD_ENTRY(openOutput) \
+BINDER_METHOD_ENTRY(openDuplicateOutput) \
+BINDER_METHOD_ENTRY(closeOutput) \
+BINDER_METHOD_ENTRY(suspendOutput) \
+BINDER_METHOD_ENTRY(restoreOutput) \
+BINDER_METHOD_ENTRY(openInput) \
+BINDER_METHOD_ENTRY(closeInput) \
+BINDER_METHOD_ENTRY(invalidateStream) \
+BINDER_METHOD_ENTRY(setVoiceVolume) \
+BINDER_METHOD_ENTRY(getRenderPosition) \
+BINDER_METHOD_ENTRY(getInputFramesLost) \
+BINDER_METHOD_ENTRY(newAudioUniqueId) \
+BINDER_METHOD_ENTRY(acquireAudioSessionId) \
+BINDER_METHOD_ENTRY(releaseAudioSessionId) \
+BINDER_METHOD_ENTRY(queryNumberEffects) \
+BINDER_METHOD_ENTRY(queryEffect) \
+BINDER_METHOD_ENTRY(getEffectDescriptor) \
+BINDER_METHOD_ENTRY(createEffect) \
+BINDER_METHOD_ENTRY(moveEffects) \
+BINDER_METHOD_ENTRY(loadHwModule) \
+BINDER_METHOD_ENTRY(getPrimaryOutputSamplingRate) \
+BINDER_METHOD_ENTRY(getPrimaryOutputFrameCount) \
+BINDER_METHOD_ENTRY(setLowRamDevice) \
+BINDER_METHOD_ENTRY(getAudioPort) \
+BINDER_METHOD_ENTRY(createAudioPatch) \
+BINDER_METHOD_ENTRY(releaseAudioPatch) \
+BINDER_METHOD_ENTRY(listAudioPatches) \
+BINDER_METHOD_ENTRY(setAudioPortConfig) \
+BINDER_METHOD_ENTRY(getAudioHwSyncForSession) \
+BINDER_METHOD_ENTRY(systemReady) \
+BINDER_METHOD_ENTRY(audioPolicyReady) \
+BINDER_METHOD_ENTRY(frameCountHAL) \
+BINDER_METHOD_ENTRY(getMicrophones) \
+BINDER_METHOD_ENTRY(setMasterBalance) \
+BINDER_METHOD_ENTRY(getMasterBalance) \
+BINDER_METHOD_ENTRY(setEffectSuspended) \
+BINDER_METHOD_ENTRY(setAudioHalPids) \
+BINDER_METHOD_ENTRY(setVibratorInfos) \
+BINDER_METHOD_ENTRY(updateSecondaryOutputs) \
+BINDER_METHOD_ENTRY(getMmapPolicyInfos) \
+BINDER_METHOD_ENTRY(getAAudioMixerBurstCount) \
+BINDER_METHOD_ENTRY(getAAudioHardwareBurstMinUsec) \
+BINDER_METHOD_ENTRY(setDeviceConnectedState) \
+BINDER_METHOD_ENTRY(setRequestedLatencyMode) \
+BINDER_METHOD_ENTRY(getSupportedLatencyModes) \
+
+
+// singleton for Binder Method Statistics for IAudioFlinger
+static auto& getIAudioFlingerStatistics() {
+    using Code = android::AudioFlingerServerAdapter::Delegate::TransactionCode;
+
+#pragma push_macro("BINDER_METHOD_ENTRY")
+#undef BINDER_METHOD_ENTRY
+#define BINDER_METHOD_ENTRY(ENTRY) \
+    {(Code)media::BnAudioFlingerService::TRANSACTION_##ENTRY, #ENTRY},
+
+    static mediautils::MethodStatistics<Code> methodStatistics{
+        IAUDIOFLINGER_BINDER_METHOD_MACRO_LIST
+        METHOD_STATISTICS_BINDER_CODE_NAMES(Code)
+    };
+#pragma pop_macro("BINDER_METHOD_ENTRY")
+
+    return methodStatistics;
+}
+
 class DevicesFactoryHalCallbackImpl : public DevicesFactoryHalCallback {
   public:
     void onNewDevicesAvailable() override {
@@ -163,31 +261,31 @@ class DevicesFactoryHalCallbackImpl : public DevicesFactoryHalCallback {
     }
 };
 
-// TODO b/182392769: use identity util
+// TODO b/182392769: use attribution source util
 /* static */
-media::permission::Identity AudioFlinger::checkIdentityPackage(
-        const media::permission::Identity& identity) {
+AttributionSourceState AudioFlinger::checkAttributionSourcePackage(
+        const AttributionSourceState& attributionSource) {
     Vector<String16> packages;
-    PermissionController{}.getPackagesForUid(identity.uid, packages);
+    PermissionController{}.getPackagesForUid(attributionSource.uid, packages);
 
-    Identity checkedIdentity = identity;
-    if (!identity.packageName.has_value() || identity.packageName.value().size() == 0) {
+    AttributionSourceState checkedAttributionSource = attributionSource;
+    if (!attributionSource.packageName.has_value()
+            || attributionSource.packageName.value().size() == 0) {
         if (!packages.isEmpty()) {
-            checkedIdentity.packageName =
+            checkedAttributionSource.packageName =
                 std::move(legacy2aidl_String16_string(packages[0]).value());
         }
     } else {
         String16 opPackageLegacy = VALUE_OR_FATAL(
-            aidl2legacy_string_view_String16(identity.packageName.value_or("")));
+            aidl2legacy_string_view_String16(attributionSource.packageName.value_or("")));
         if (std::find_if(packages.begin(), packages.end(),
                 [&opPackageLegacy](const auto& package) {
                 return opPackageLegacy == package; }) == packages.end()) {
             ALOGW("The package name(%s) provided does not correspond to the uid %d",
-                    identity.packageName.value_or("").c_str(), identity.uid);
-            checkedIdentity.packageName = std::optional<std::string>();
+                    attributionSource.packageName.value_or("").c_str(), attributionSource.uid);
         }
     }
-    return checkedIdentity;
+    return checkedAttributionSource;
 }
 
 // ----------------------------------------------------------------------------
@@ -236,11 +334,12 @@ AudioFlinger::AudioFlinger()
     timespec ts{};
     clock_gettime(CLOCK_MONOTONIC, &ts);
     // zero ID has a special meaning, so start allocation at least at AUDIO_UNIQUE_ID_USE_MAX
-    uint32_t sessionBase = (uint32_t)std::max((long)1, ts.tv_sec);
+    uint32_t movingBase = (uint32_t)std::max((long)1, ts.tv_sec);
     // unsigned instead of audio_unique_id_use_t, because ++ operator is unavailable for enum
     for (unsigned use = AUDIO_UNIQUE_ID_USE_UNSPECIFIED; use < AUDIO_UNIQUE_ID_USE_MAX; use++) {
         mNextUniqueIds[use] =
-                ((use == AUDIO_UNIQUE_ID_USE_SESSION) ? sessionBase : 1) * AUDIO_UNIQUE_ID_USE_MAX;
+                ((use == AUDIO_UNIQUE_ID_USE_SESSION || use == AUDIO_UNIQUE_ID_USE_CLIENT) ?
+                        movingBase : 1) * AUDIO_UNIQUE_ID_USE_MAX;
     }
 
 #if 1
@@ -266,7 +365,7 @@ AudioFlinger::AudioFlinger()
     mMediaLogNotifier->run("MediaLogNotifier");
     std::vector<pid_t> halPids;
     mDevicesFactoryHal->getHalPids(&halPids);
-    TimeCheck::setAudioHalPids(halPids);
+    mediautils::TimeCheck::setAudioHalPids(halPids);
 
     // Notify that we have started (also called when audioserver service restarts)
     mediametrics::LogItem(mMetricsId)
@@ -298,10 +397,15 @@ void AudioFlinger::onFirstRef()
 
     mDevicesFactoryHalCallback = new DevicesFactoryHalCallbackImpl;
     mDevicesFactoryHal->setCallbackOnce(mDevicesFactoryHalCallback);
+
+    if (mDevicesFactoryHal->getHalVersion() <= MAX_AAUDIO_PROPERTY_DEVICE_HAL_VERSION) {
+        mAAudioBurstsPerBuffer = getAAudioMixerBurstCountFromSystemProperty();
+        mAAudioHwBurstMinMicros = getAAudioHardwareBurstMinUsecFromSystemProperty();
+    }
 }
 
 status_t AudioFlinger::setAudioHalPids(const std::vector<pid_t>& pids) {
-  TimeCheck::setAudioHalPids(pids);
+  mediautils::TimeCheck::setAudioHalPids(pids);
   return NO_ERROR;
 }
 
@@ -312,12 +416,89 @@ status_t AudioFlinger::setVibratorInfos(
     return NO_ERROR;
 }
 
-// getDefaultVibratorInfo_l must be called with AudioFlinger lock held.
-const media::AudioVibratorInfo* AudioFlinger::getDefaultVibratorInfo_l() {
-    if (mAudioVibratorInfos.empty()) {
-        return nullptr;
+status_t AudioFlinger::updateSecondaryOutputs(
+        const TrackSecondaryOutputsMap& trackSecondaryOutputs) {
+    Mutex::Autolock _l(mLock);
+    for (const auto& [trackId, secondaryOutputs] : trackSecondaryOutputs) {
+        size_t i = 0;
+        for (; i < mPlaybackThreads.size(); ++i) {
+            PlaybackThread *thread = mPlaybackThreads.valueAt(i).get();
+            Mutex::Autolock _tl(thread->mLock);
+            sp<PlaybackThread::Track> track = thread->getTrackById_l(trackId);
+            if (track != nullptr) {
+                ALOGD("%s trackId: %u", __func__, trackId);
+                updateSecondaryOutputsForTrack_l(track.get(), thread, secondaryOutputs);
+                break;
+            }
+        }
+        ALOGW_IF(i >= mPlaybackThreads.size(),
+                 "%s cannot find track with id %u", __func__, trackId);
     }
-    return &mAudioVibratorInfos.front();
+    return NO_ERROR;
+}
+
+status_t AudioFlinger::getMmapPolicyInfos(
+            AudioMMapPolicyType policyType, std::vector<AudioMMapPolicyInfo> *policyInfos) {
+    Mutex::Autolock _l(mLock);
+    if (const auto it = mPolicyInfos.find(policyType); it != mPolicyInfos.end()) {
+        *policyInfos = it->second;
+        return NO_ERROR;
+    }
+    if (mDevicesFactoryHal->getHalVersion() > MAX_AAUDIO_PROPERTY_DEVICE_HAL_VERSION) {
+        AutoMutex lock(mHardwareLock);
+        for (size_t i = 0; i < mAudioHwDevs.size(); ++i) {
+            AudioHwDevice *dev = mAudioHwDevs.valueAt(i);
+            std::vector<AudioMMapPolicyInfo> infos;
+            status_t status = dev->getMmapPolicyInfos(policyType, &infos);
+            if (status != NO_ERROR) {
+                ALOGE("Failed to query mmap policy info of %d, error %d",
+                      mAudioHwDevs.keyAt(i), status);
+                continue;
+            }
+            policyInfos->insert(policyInfos->end(), infos.begin(), infos.end());
+        }
+        mPolicyInfos[policyType] = *policyInfos;
+    } else {
+        getMmapPolicyInfosFromSystemProperty(policyType, policyInfos);
+        mPolicyInfos[policyType] = *policyInfos;
+    }
+    return NO_ERROR;
+}
+
+int32_t AudioFlinger::getAAudioMixerBurstCount() {
+    Mutex::Autolock _l(mLock);
+    return mAAudioBurstsPerBuffer;
+}
+
+int32_t AudioFlinger::getAAudioHardwareBurstMinUsec() {
+    Mutex::Autolock _l(mLock);
+    return mAAudioHwBurstMinMicros;
+}
+
+status_t AudioFlinger::setDeviceConnectedState(const struct audio_port_v7 *port, bool connected) {
+    status_t final_result = NO_INIT;
+    Mutex::Autolock _l(mLock);
+    AutoMutex lock(mHardwareLock);
+    mHardwareStatus = AUDIO_HW_SET_CONNECTED_STATE;
+    for (size_t i = 0; i < mAudioHwDevs.size(); i++) {
+        sp<DeviceHalInterface> dev = mAudioHwDevs.valueAt(i)->hwDevice();
+        status_t result = dev->setConnectedState(port, connected);
+        // Same logic as with setParameter: it's a success if at least one
+        // HAL module accepts the update.
+        if (final_result != NO_ERROR) {
+            final_result = result;
+        }
+    }
+    mHardwareStatus = AUDIO_HW_IDLE;
+    return final_result;
+}
+
+// getDefaultVibratorInfo_l must be called with AudioFlinger lock held.
+std::optional<media::AudioVibratorInfo> AudioFlinger::getDefaultVibratorInfo_l() {
+    if (mAudioVibratorInfos.empty()) {
+        return {};
+    }
+    return mAudioVibratorInfos.front();
 }
 
 AudioFlinger::~AudioFlinger()
@@ -400,27 +581,54 @@ status_t AudioFlinger::openMmapStream(MmapStreamInterface::stream_direction_t di
     audio_io_handle_t io = AUDIO_IO_HANDLE_NONE;
     audio_port_handle_t portId = AUDIO_PORT_HANDLE_NONE;
     audio_attributes_t localAttr = *attr;
+
+    // TODO b/182392553: refactor or make clearer
+    pid_t clientPid =
+        VALUE_OR_RETURN_STATUS(aidl2legacy_int32_t_pid_t(client.attributionSource.pid));
+    bool updatePid = (clientPid == (pid_t)-1);
+    const uid_t callingUid = IPCThreadState::self()->getCallingUid();
+
+    AttributionSourceState adjAttributionSource = client.attributionSource;
+    if (!isAudioServerOrMediaServerOrSystemServerOrRootUid(callingUid)) {
+        uid_t clientUid =
+            VALUE_OR_RETURN_STATUS(aidl2legacy_int32_t_uid_t(client.attributionSource.uid));
+        ALOGW_IF(clientUid != callingUid,
+                "%s uid %d tried to pass itself off as %d",
+                __FUNCTION__, callingUid, clientUid);
+        adjAttributionSource.uid = VALUE_OR_RETURN_STATUS(legacy2aidl_uid_t_int32_t(callingUid));
+        updatePid = true;
+    }
+    if (updatePid) {
+        const pid_t callingPid = IPCThreadState::self()->getCallingPid();
+        ALOGW_IF(clientPid != (pid_t)-1 && clientPid != callingPid,
+                 "%s uid %d pid %d tried to pass itself off as pid %d",
+                 __func__, callingUid, callingPid, clientPid);
+        adjAttributionSource.pid = VALUE_OR_RETURN_STATUS(legacy2aidl_pid_t_int32_t(callingPid));
+    }
+    adjAttributionSource = AudioFlinger::checkAttributionSourcePackage(
+            adjAttributionSource);
+
     if (direction == MmapStreamInterface::DIRECTION_OUTPUT) {
         audio_config_t fullConfig = AUDIO_CONFIG_INITIALIZER;
         fullConfig.sample_rate = config->sample_rate;
         fullConfig.channel_mask = config->channel_mask;
         fullConfig.format = config->format;
         std::vector<audio_io_handle_t> secondaryOutputs;
-
+        bool isSpatialized;
         ret = AudioSystem::getOutputForAttr(&localAttr, &io,
                                             actualSessionId,
-                                            &streamType, client.identity,
+                                            &streamType, adjAttributionSource,
                                             &fullConfig,
                                             (audio_output_flags_t)(AUDIO_OUTPUT_FLAG_MMAP_NOIRQ |
                                                     AUDIO_OUTPUT_FLAG_DIRECT),
-                                            deviceId, &portId, &secondaryOutputs);
+                                            deviceId, &portId, &secondaryOutputs, &isSpatialized);
         ALOGW_IF(!secondaryOutputs.empty(),
                  "%s does not support secondary outputs, ignoring them", __func__);
     } else {
         ret = AudioSystem::getInputForAttr(&localAttr, &io,
                                               RECORD_RIID_INVALID,
                                               actualSessionId,
-                                              client.identity,
+                                              adjAttributionSource,
                                               config,
                                               AUDIO_INPUT_FLAG_MMAP_NOIRQ, deviceId, &portId);
     }
@@ -543,10 +751,12 @@ void AudioFlinger::dumpClients(int fd, const Vector<String16>& args __unused)
     String8 result;
 
     result.append("Clients:\n");
+    result.append("   pid    heap_size\n");
     for (size_t i = 0; i < mClients.size(); ++i) {
         sp<Client> client = mClients.valueAt(i).promote();
         if (client != 0) {
-            result.appendFormat("  pid: %d\n", client->pid());
+            result.appendFormat("%6d %12zu\n", client->pid(),
+                    client->heap()->getMemoryHeap()->getSize());
         }
     }
 
@@ -672,7 +882,7 @@ status_t AudioFlinger::dump(int fd, const Vector<String16>& args)
         // dump all hardware devs
         for (size_t i = 0; i < mAudioHwDevs.size(); i++) {
             sp<DeviceHalInterface> dev = mAudioHwDevs.valueAt(i)->hwDevice();
-            dev->dump(fd);
+            dev->dump(fd, args);
         }
 
         mPatchPanel.dump(fd);
@@ -733,6 +943,36 @@ status_t AudioFlinger::dump(int fd, const Vector<String16>& args)
             // TODO - should limit be an argument parameter?
             std::string s = GetUnreachableMemoryString(true /* contents */, 100 /* limit */);
             write(fd, s.c_str(), s.size());
+        }
+        {
+            std::string timeCheckStats = getIAudioFlingerStatistics().dump();
+            dprintf(fd, "\nIAudioFlinger binder call profile:\n");
+            write(fd, timeCheckStats.c_str(), timeCheckStats.size());
+
+            extern mediautils::MethodStatistics<int>& getIEffectStatistics();
+            timeCheckStats = getIEffectStatistics().dump();
+            dprintf(fd, "\nIEffect binder call profile:\n");
+            write(fd, timeCheckStats.c_str(), timeCheckStats.size());
+
+            // Automatically fetch HIDL statistics.
+            std::shared_ptr<std::vector<std::string>> hidlClassNames =
+                    mediautils::getStatisticsClassesForModule(
+                            METHOD_STATISTICS_MODULE_NAME_AUDIO_HIDL);
+            if (hidlClassNames) {
+                for (const auto& className : *hidlClassNames) {
+                    auto stats = mediautils::getStatisticsForClass(className);
+                    if (stats) {
+                        timeCheckStats = stats->dump();
+                        dprintf(fd, "\n%s binder call profile:\n", className.c_str());
+                        write(fd, timeCheckStats.c_str(), timeCheckStats.size());
+                    }
+                }
+            }
+
+            timeCheckStats = mediautils::TimeCheck::toString();
+            dprintf(fd, "\nTimeCheck:\n");
+            write(fd, timeCheckStats.c_str(), timeCheckStats.size());
+            dprintf(fd, "\n");
         }
     }
     return NO_ERROR;
@@ -823,24 +1063,25 @@ status_t AudioFlinger::createTrack(const media::CreateTrackRequest& _input,
     audio_stream_type_t streamType;
     audio_port_handle_t portId = AUDIO_PORT_HANDLE_NONE;
     std::vector<audio_io_handle_t> secondaryOutputs;
+    bool isSpatialized = false;;
 
     // TODO b/182392553: refactor or make clearer
     pid_t clientPid =
-        VALUE_OR_RETURN_STATUS(aidl2legacy_int32_t_pid_t(input.clientInfo.identity.pid));
+        VALUE_OR_RETURN_STATUS(aidl2legacy_int32_t_pid_t(input.clientInfo.attributionSource.pid));
     bool updatePid = (clientPid == (pid_t)-1);
     const uid_t callingUid = IPCThreadState::self()->getCallingUid();
     uid_t clientUid =
-        VALUE_OR_RETURN_STATUS(aidl2legacy_int32_t_uid_t(input.clientInfo.identity.uid));
+        VALUE_OR_RETURN_STATUS(aidl2legacy_int32_t_uid_t(input.clientInfo.attributionSource.uid));
     audio_io_handle_t effectThreadId = AUDIO_IO_HANDLE_NONE;
     std::vector<int> effectIds;
     audio_attributes_t localAttr = input.attr;
 
-    Identity adjIdentity = input.clientInfo.identity;
-    if (!isAudioServerOrMediaServerUid(callingUid)) {
+    AttributionSourceState adjAttributionSource = input.clientInfo.attributionSource;
+    if (!isAudioServerOrMediaServerOrSystemServerOrRootUid(callingUid)) {
         ALOGW_IF(clientUid != callingUid,
                 "%s uid %d tried to pass itself off as %d",
                 __FUNCTION__, callingUid, clientUid);
-        adjIdentity.uid = VALUE_OR_RETURN_STATUS(legacy2aidl_uid_t_int32_t(callingUid));
+        adjAttributionSource.uid = VALUE_OR_RETURN_STATUS(legacy2aidl_uid_t_int32_t(callingUid));
         clientUid = callingUid;
         updatePid = true;
     }
@@ -850,8 +1091,10 @@ status_t AudioFlinger::createTrack(const media::CreateTrackRequest& _input,
                  "%s uid %d pid %d tried to pass itself off as pid %d",
                  __func__, callingUid, callingPid, clientPid);
         clientPid = callingPid;
-        adjIdentity.pid = VALUE_OR_RETURN_STATUS(legacy2aidl_pid_t_int32_t(callingPid));
+        adjAttributionSource.pid = VALUE_OR_RETURN_STATUS(legacy2aidl_pid_t_int32_t(callingPid));
     }
+    adjAttributionSource = AudioFlinger::checkAttributionSourcePackage(
+            adjAttributionSource);
 
     audio_session_t sessionId = input.sessionId;
     if (sessionId == AUDIO_SESSION_ALLOCATE) {
@@ -865,8 +1108,9 @@ status_t AudioFlinger::createTrack(const media::CreateTrackRequest& _input,
     output.outputId = AUDIO_IO_HANDLE_NONE;
     output.selectedDeviceId = input.selectedDeviceId;
     lStatus = AudioSystem::getOutputForAttr(&localAttr, &output.outputId, sessionId, &streamType,
-                                            adjIdentity, &input.config, input.flags,
-                                            &output.selectedDeviceId, &portId, &secondaryOutputs);
+                                            adjAttributionSource, &input.config, input.flags,
+                                            &output.selectedDeviceId, &portId, &secondaryOutputs,
+                                            &isSpatialized);
 
     if (lStatus != NO_ERROR || output.outputId == AUDIO_IO_HANDLE_NONE) {
         ALOGE("createTrack() getOutputForAttr() return error %d or invalid output handle", lStatus);
@@ -924,14 +1168,15 @@ status_t AudioFlinger::createTrack(const media::CreateTrackRequest& _input,
         output.frameCount = input.frameCount;
         output.notificationFrameCount = input.notificationFrameCount;
         output.flags = input.flags;
+        output.streamType = streamType;
 
         track = thread->createTrack_l(client, streamType, localAttr, &output.sampleRate,
                                       input.config.format, input.config.channel_mask,
                                       &output.frameCount, &output.notificationFrameCount,
                                       input.notificationsPerBuffer, input.speed,
                                       input.sharedBuffer, sessionId, &output.flags,
-                                      callingPid, adjIdentity, input.clientInfo.clientTid,
-                                      &lStatus, portId, input.audioTrackCallback);
+                                      callingPid, adjAttributionSource, input.clientInfo.clientTid,
+                                      &lStatus, portId, input.audioTrackCallback, isSpatialized);
         LOG_ALWAYS_FATAL_IF((lStatus == NO_ERROR) && (track == 0));
         // we don't abort yet if lStatus != NO_ERROR; there is still work to be done regardless
 
@@ -944,88 +1189,7 @@ status_t AudioFlinger::createTrack(const media::CreateTrackRequest& _input,
             // Connect secondary outputs. Failure on a secondary output must not imped the primary
             // Any secondary output setup failure will lead to a desync between the AP and AF until
             // the track is destroyed.
-            TeePatches teePatches;
-            for (audio_io_handle_t secondaryOutput : secondaryOutputs) {
-                PlaybackThread *secondaryThread = checkPlaybackThread_l(secondaryOutput);
-                if (secondaryThread == NULL) {
-                    ALOGE("no playback thread found for secondary output %d", output.outputId);
-                    continue;
-                }
-
-                size_t sourceFrameCount = thread->frameCount() * output.sampleRate
-                                          / thread->sampleRate();
-                size_t sinkFrameCount = secondaryThread->frameCount() * output.sampleRate
-                                          / secondaryThread->sampleRate();
-                // If the secondary output has just been opened, the first secondaryThread write
-                // will not block as it will fill the empty startup buffer of the HAL,
-                // so a second sink buffer needs to be ready for the immediate next blocking write.
-                // Additionally, have a margin of one main thread buffer as the scheduling jitter
-                // can reorder the writes (eg if thread A&B have the same write intervale,
-                // the scheduler could schedule AB...BA)
-                size_t frameCountToBeReady = 2 * sinkFrameCount + sourceFrameCount;
-                // Total secondary output buffer must be at least as the read frames plus
-                // the margin of a few buffers on both sides in case the
-                // threads scheduling has some jitter.
-                // That value should not impact latency as the secondary track is started before
-                // its buffer is full, see frameCountToBeReady.
-                size_t frameCount = frameCountToBeReady + 2 * (sourceFrameCount + sinkFrameCount);
-                // The frameCount should also not be smaller than the secondary thread min frame
-                // count
-                size_t minFrameCount = AudioSystem::calculateMinFrameCount(
-                            [&] { Mutex::Autolock _l(secondaryThread->mLock);
-                                  return secondaryThread->latency_l(); }(),
-                            secondaryThread->mNormalFrameCount,
-                            secondaryThread->mSampleRate,
-                            output.sampleRate,
-                            input.speed);
-                frameCount = std::max(frameCount, minFrameCount);
-
-                using namespace std::chrono_literals;
-                auto inChannelMask = audio_channel_mask_out_to_in(input.config.channel_mask);
-                sp patchRecord = new RecordThread::PatchRecord(nullptr /* thread */,
-                                                               output.sampleRate,
-                                                               inChannelMask,
-                                                               input.config.format,
-                                                               frameCount,
-                                                               NULL /* buffer */,
-                                                               (size_t)0 /* bufferSize */,
-                                                               AUDIO_INPUT_FLAG_DIRECT,
-                                                               0ns /* timeout */);
-                status_t status = patchRecord->initCheck();
-                if (status != NO_ERROR) {
-                    ALOGE("Secondary output patchRecord init failed: %d", status);
-                    continue;
-                }
-
-                // TODO: We could check compatibility of the secondaryThread with the PatchTrack
-                // for fast usage: thread has fast mixer, sample rate matches, etc.;
-                // for now, we exclude fast tracks by removing the Fast flag.
-                const audio_output_flags_t outputFlags =
-                        (audio_output_flags_t)(output.flags & ~AUDIO_OUTPUT_FLAG_FAST);
-                sp patchTrack = new PlaybackThread::PatchTrack(secondaryThread,
-                                                               streamType,
-                                                               output.sampleRate,
-                                                               input.config.channel_mask,
-                                                               input.config.format,
-                                                               frameCount,
-                                                               patchRecord->buffer(),
-                                                               patchRecord->bufferSize(),
-                                                               outputFlags,
-                                                               0ns /* timeout */,
-                                                               frameCountToBeReady);
-                status = patchTrack->initCheck();
-                if (status != NO_ERROR) {
-                    ALOGE("Secondary output patchTrack init failed: %d", status);
-                    continue;
-                }
-                teePatches.push_back({patchRecord, patchTrack});
-                secondaryThread->addPatchTrack(patchTrack);
-                // In case the downstream patchTrack on the secondaryThread temporarily outlives
-                // our created track, ensure the corresponding patchRecord is still alive.
-                patchTrack->setPeerProxy(patchRecord, true /* holdReference */);
-                patchRecord->setPeerProxy(patchTrack, false /* holdReference */);
-            }
-            track->setTeePatches(std::move(teePatches));
+            updateSecondaryOutputsForTrack_l(track.get(), thread, secondaryOutputs);
         }
 
         // move effect chain to this output thread if an effect on same session was waiting
@@ -1054,8 +1218,9 @@ status_t AudioFlinger::createTrack(const media::CreateTrackRequest& _input,
                 }
             }
         }
-
-        setAudioHwSyncForSession_l(thread, sessionId);
+        if ((output.flags & AUDIO_OUTPUT_FLAG_HW_AV_SYNC) == AUDIO_OUTPUT_FLAG_HW_AV_SYNC) {
+            setAudioHwSyncForSession_l(thread, sessionId);
+        }
     }
 
     if (lStatus != NO_ERROR) {
@@ -1447,6 +1612,32 @@ status_t AudioFlinger::setStreamVolume(audio_stream_type_t stream, float value,
     volumeInterface->setStreamVolume(stream, value);
 
     return NO_ERROR;
+}
+
+status_t AudioFlinger::setRequestedLatencyMode(
+        audio_io_handle_t output, audio_latency_mode_t mode) {
+    if (output == AUDIO_IO_HANDLE_NONE) {
+        return BAD_VALUE;
+    }
+    AutoMutex lock(mLock);
+    PlaybackThread *thread = checkPlaybackThread_l(output);
+    if (thread == nullptr) {
+        return BAD_VALUE;
+    }
+    return thread->setRequestedLatencyMode(mode);
+}
+
+status_t AudioFlinger::getSupportedLatencyModes(audio_io_handle_t output,
+            std::vector<audio_latency_mode_t>* modes) {
+    if (output == AUDIO_IO_HANDLE_NONE) {
+        return BAD_VALUE;
+    }
+    AutoMutex lock(mLock);
+    PlaybackThread *thread = checkPlaybackThread_l(output);
+    if (thread == nullptr) {
+        return BAD_VALUE;
+    }
+    return thread->getSupportedLatencyModes(modes);
 }
 
 status_t AudioFlinger::setStreamMute(audio_stream_type_t stream, bool muted)
@@ -1930,13 +2121,13 @@ void AudioFlinger::removeNotificationClient(pid_t pid)
     }
 }
 
-void AudioFlinger::ioConfigChanged(audio_io_config_event event,
+void AudioFlinger::ioConfigChanged(audio_io_config_event_t event,
                                    const sp<AudioIoDescriptor>& ioDesc,
                                    pid_t pid) {
+    media::AudioIoConfigEvent eventAidl = VALUE_OR_FATAL(
+            legacy2aidl_audio_io_config_event_t_AudioIoConfigEvent(event));
     media::AudioIoDescriptor descAidl = VALUE_OR_FATAL(
             legacy2aidl_AudioIoDescriptor_AudioIoDescriptor(ioDesc));
-    media::AudioIoConfigEvent eventAidl = VALUE_OR_FATAL(
-            legacy2aidl_audio_io_config_event_AudioIoConfigEvent(event));
 
     Mutex::Autolock _l(mClientLock);
     size_t size = mNotificationClients.size();
@@ -1945,6 +2136,21 @@ void AudioFlinger::ioConfigChanged(audio_io_config_event event,
             mNotificationClients.valueAt(i)->audioFlingerClient()->ioConfigChanged(eventAidl,
                                                                                    descAidl);
         }
+    }
+}
+
+void AudioFlinger::onSupportedLatencyModesChanged(
+        audio_io_handle_t output, const std::vector<audio_latency_mode_t>& modes) {
+    int32_t outputAidl = VALUE_OR_FATAL(legacy2aidl_audio_io_handle_t_int32_t(output));
+    std::vector<media::LatencyMode> modesAidl = VALUE_OR_FATAL(
+                convertContainer<std::vector<media::LatencyMode>>(modes,
+                        legacy2aidl_audio_latency_mode_t_LatencyMode));
+
+    Mutex::Autolock _l(mClientLock);
+    size_t size = mNotificationClients.size();
+    for (size_t i = 0; i < size; i++) {
+        mNotificationClients.valueAt(i)->audioFlingerClient()
+                ->onSupportedLatencyModesChanged(outputAidl, modesAidl);
     }
 }
 
@@ -2090,26 +2296,29 @@ status_t AudioFlinger::createRecord(const media::CreateRecordRequest& _input,
     output.inputId = AUDIO_IO_HANDLE_NONE;
 
     // TODO b/182392553: refactor or clean up
-    Identity adjIdentity = input.clientInfo.identity;
-    bool updatePid = (adjIdentity.pid == -1);
+    AttributionSourceState adjAttributionSource = input.clientInfo.attributionSource;
+    bool updatePid = (adjAttributionSource.pid == -1);
     const uid_t callingUid = IPCThreadState::self()->getCallingUid();
-    const uid_t currentUid = VALUE_OR_RETURN_STATUS(legacy2aidl_uid_t_int32_t(adjIdentity.uid));
-    if (!isAudioServerOrMediaServerUid(callingUid)) {
+    const uid_t currentUid = VALUE_OR_RETURN_STATUS(legacy2aidl_uid_t_int32_t(
+           adjAttributionSource.uid));
+    if (!isAudioServerOrMediaServerOrSystemServerOrRootUid(callingUid)) {
         ALOGW_IF(currentUid != callingUid,
                 "%s uid %d tried to pass itself off as %d",
                 __FUNCTION__, callingUid, currentUid);
-        adjIdentity.uid = VALUE_OR_RETURN_STATUS(legacy2aidl_uid_t_int32_t(callingUid));
+        adjAttributionSource.uid = VALUE_OR_RETURN_STATUS(legacy2aidl_uid_t_int32_t(callingUid));
         updatePid = true;
     }
     const pid_t callingPid = IPCThreadState::self()->getCallingPid();
-    const pid_t currentPid = VALUE_OR_RETURN_STATUS(aidl2legacy_int32_t_pid_t(adjIdentity.pid));
+    const pid_t currentPid = VALUE_OR_RETURN_STATUS(aidl2legacy_int32_t_pid_t(
+            adjAttributionSource.pid));
     if (updatePid) {
         ALOGW_IF(currentPid != (pid_t)-1 && currentPid != callingPid,
                  "%s uid %d pid %d tried to pass itself off as pid %d",
                  __func__, callingUid, callingPid, currentPid);
-        adjIdentity.pid = VALUE_OR_RETURN_STATUS(legacy2aidl_pid_t_int32_t(callingPid));
+        adjAttributionSource.pid = VALUE_OR_RETURN_STATUS(legacy2aidl_pid_t_int32_t(callingPid));
     }
-
+    adjAttributionSource = AudioFlinger::checkAttributionSourcePackage(
+            adjAttributionSource);
     // we don't yet support anything other than linear PCM
     if (!audio_is_valid_format(input.config.format) || !audio_is_linear_pcm(input.config.format)) {
         ALOGE("createRecord() invalid format %#x", input.config.format);
@@ -2135,7 +2344,7 @@ status_t AudioFlinger::createRecord(const media::CreateRecordRequest& _input,
     output.selectedDeviceId = input.selectedDeviceId;
     output.flags = input.flags;
 
-    client = registerPid(VALUE_OR_FATAL(aidl2legacy_int32_t_pid_t(adjIdentity.pid)));
+    client = registerPid(VALUE_OR_FATAL(aidl2legacy_int32_t_pid_t(adjAttributionSource.pid)));
 
     // Not a conventional loop, but a retry loop for at most two iterations total.
     // Try first maybe with FAST flag then try again without FAST flag if that fails.
@@ -2155,7 +2364,7 @@ status_t AudioFlinger::createRecord(const media::CreateRecordRequest& _input,
                                       input.riid,
                                       sessionId,
                                     // FIXME compare to AudioTrack
-                                      adjIdentity,
+                                      adjAttributionSource,
                                       &input.config,
                                       output.flags, &output.selectedDeviceId, &portId);
     if (lStatus != NO_ERROR) {
@@ -2182,7 +2391,7 @@ status_t AudioFlinger::createRecord(const media::CreateRecordRequest& _input,
                                                   input.config.format, input.config.channel_mask,
                                                   &output.frameCount, sessionId,
                                                   &output.notificationFrameCount,
-                                                  callingPid, adjIdentity, &output.flags,
+                                                  callingPid, adjAttributionSource, &output.flags,
                                                   input.clientInfo.clientTid,
                                                   &lStatus, portId, input.maxSharedAudioHistoryMs);
         LOG_ALWAYS_FATAL_IF((lStatus == NO_ERROR) && (recordTrack == 0));
@@ -2195,6 +2404,20 @@ status_t AudioFlinger::createRecord(const media::CreateRecordRequest& _input,
 
         if (lStatus != NO_ERROR) {
             goto Exit;
+        }
+
+        if (recordTrack->isFastTrack()) {
+            output.serverConfig = {
+                    thread->sampleRate(),
+                    thread->channelMask(),
+                    thread->format()
+            };
+        } else {
+            output.serverConfig = {
+                    recordTrack->sampleRate(),
+                    recordTrack->channelMask(),
+                    recordTrack->format()
+            };
         }
 
         // Check if one effect chain was awaiting for an AudioRecord to be created on this
@@ -2327,6 +2550,18 @@ audio_module_handle_t AudioFlinger::loadHwModule_l(const char *name)
         mHardwareStatus = AUDIO_HW_IDLE;
     }
 
+    if (mDevicesFactoryHal->getHalVersion() > MAX_AAUDIO_PROPERTY_DEVICE_HAL_VERSION) {
+        if (int32_t mixerBursts = dev->getAAudioMixerBurstCount();
+            mixerBursts > 0 && mixerBursts > mAAudioBurstsPerBuffer) {
+            mAAudioBurstsPerBuffer = mixerBursts;
+        }
+        if (int32_t hwBurstMinMicros = dev->getAAudioHardwareBurstMinUsec();
+            hwBurstMinMicros > 0
+            && (hwBurstMinMicros < mAAudioHwBurstMinMicros || mAAudioHwBurstMinMicros == 0)) {
+            mAAudioHwBurstMinMicros = hwBurstMinMicros;
+        }
+    }
+
     mAudioHwDevs.add(handle, audioDevice);
 
     ALOGI("loadHwModule() Loaded %s audio interface, handle %d", name, handle);
@@ -2451,21 +2686,17 @@ audio_hw_sync_t AudioFlinger::getAudioHwSyncForSession(audio_session_t sessionId
     if (dev == nullptr) {
         return AUDIO_HW_SYNC_INVALID;
     }
-    String8 reply;
-    AudioParameter param;
-    if (dev->getParameters(String8(AudioParameter::keyHwAvSync), &reply) == OK) {
-        param = AudioParameter(reply);
-    }
 
-    int value;
-    if (param.getInt(String8(AudioParameter::keyHwAvSync), value) != NO_ERROR) {
+    error::Result<audio_hw_sync_t> result = dev->getHwAvSync();
+    if (!result.ok()) {
         ALOGW("getAudioHwSyncForSession error getting sync for session %d", sessionId);
         return AUDIO_HW_SYNC_INVALID;
     }
+    audio_hw_sync_t value = VALUE_OR_FATAL(result);
 
     // allow only one session for a given HW A/V sync ID.
     for (size_t i = 0; i < mHwAvSyncIds.size(); i++) {
-        if (mHwAvSyncIds.valueAt(i) == (audio_hw_sync_t)value) {
+        if (mHwAvSyncIds.valueAt(i) == value) {
             ALOGV("getAudioHwSyncForSession removing ID %d for session %d",
                   value, mHwAvSyncIds.keyAt(i));
             mHwAvSyncIds.removeItemsAt(i);
@@ -2508,6 +2739,10 @@ status_t AudioFlinger::systemReady()
     }
     for (size_t i = 0; i < mRecordThreads.size(); i++) {
         ThreadBase *thread = (ThreadBase *)mRecordThreads.valueAt(i).get();
+        thread->systemReady();
+    }
+    for (size_t i = 0; i < mMmapThreads.size(); i++) {
+        ThreadBase *thread = (ThreadBase *)mMmapThreads.valueAt(i).get();
         thread->systemReady();
     }
     return NO_ERROR;
@@ -2556,14 +2791,15 @@ void AudioFlinger::setAudioHwSyncForSession_l(PlaybackThread *thread, audio_sess
 
 sp<AudioFlinger::ThreadBase> AudioFlinger::openOutput_l(audio_module_handle_t module,
                                                         audio_io_handle_t *output,
-                                                        audio_config_t *config,
+                                                        audio_config_t *halConfig,
+                                                        audio_config_base_t *mixerConfig __unused,
                                                         audio_devices_t deviceType,
                                                         const String8& address,
                                                         audio_output_flags_t flags)
 {
     AudioHwDevice *outHwDev = findSuitableHwDev_l(module, deviceType);
     if (outHwDev == NULL) {
-        return 0;
+        return nullptr;
     }
 
     if (*output == AUDIO_IO_HANDLE_NONE) {
@@ -2572,8 +2808,16 @@ sp<AudioFlinger::ThreadBase> AudioFlinger::openOutput_l(audio_module_handle_t mo
         // Audio Policy does not currently request a specific output handle.
         // If this is ever needed, see openInput_l() for example code.
         ALOGE("openOutput_l requested output handle %d is not AUDIO_IO_HANDLE_NONE", *output);
-        return 0;
+        return nullptr;
     }
+
+#ifndef MULTICHANNEL_EFFECT_CHAIN
+    if (flags & AUDIO_OUTPUT_FLAG_SPATIALIZER) {
+        ALOGE("openOutput_l() cannot create spatializer thread "
+                "without #define MULTICHANNEL_EFFECT_CHAIN");
+        return nullptr;
+    }
+#endif
 
     mHardwareStatus = AUDIO_HW_OUTPUT_OPEN;
 
@@ -2584,16 +2828,16 @@ sp<AudioFlinger::ThreadBase> AudioFlinger::openOutput_l(audio_module_handle_t mo
         // Check only for Normal Mixing mode
         if (kEnableExtendedPrecision) {
             // Specify format (uncomment one below to choose)
-            //config->format = AUDIO_FORMAT_PCM_FLOAT;
-            //config->format = AUDIO_FORMAT_PCM_24_BIT_PACKED;
-            //config->format = AUDIO_FORMAT_PCM_32_BIT;
-            //config->format = AUDIO_FORMAT_PCM_8_24_BIT;
-            // ALOGV("openOutput_l() upgrading format to %#08x", config->format);
+            //halConfig->format = AUDIO_FORMAT_PCM_FLOAT;
+            //halConfig->format = AUDIO_FORMAT_PCM_24_BIT_PACKED;
+            //halConfig->format = AUDIO_FORMAT_PCM_32_BIT;
+            //halConfig->format = AUDIO_FORMAT_PCM_8_24_BIT;
+            // ALOGV("openOutput_l() upgrading format to %#08x", halConfig->format);
         }
         if (kEnableExtendedChannels) {
             // Specify channel mask (uncomment one below to choose)
-            //config->channel_mask = audio_channel_out_mask_from_count(4);  // for USB 4ch
-            //config->channel_mask = audio_channel_mask_from_representation_and_bits(
+            //halConfig->channel_mask = audio_channel_out_mask_from_count(4);  // for USB 4ch
+            //halConfig->channel_mask = audio_channel_mask_from_representation_and_bits(
             //        AUDIO_CHANNEL_REPRESENTATION_INDEX, (1 << 4) - 1);  // another 4ch example
         }
     }
@@ -2604,7 +2848,7 @@ sp<AudioFlinger::ThreadBase> AudioFlinger::openOutput_l(audio_module_handle_t mo
             *output,
             deviceType,
             flags,
-            config,
+            halConfig,
             address.string());
 
     mHardwareStatus = AUDIO_HW_IDLE;
@@ -2619,13 +2863,18 @@ sp<AudioFlinger::ThreadBase> AudioFlinger::openOutput_l(audio_module_handle_t mo
             return thread;
         } else {
             sp<PlaybackThread> thread;
-            if (flags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD) {
+            if (flags & AUDIO_OUTPUT_FLAG_SPATIALIZER) {
+                thread = new SpatializerThread(this, outputStream, *output,
+                                                    mSystemReady, mixerConfig);
+                ALOGV("openOutput_l() created spatializer output: ID %d thread %p",
+                      *output, thread.get());
+            } else if (flags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD) {
                 thread = new OffloadThread(this, outputStream, *output, mSystemReady);
                 ALOGV("openOutput_l() created offload output: ID %d thread %p",
                       *output, thread.get());
             } else if ((flags & AUDIO_OUTPUT_FLAG_DIRECT)
-                    || !isValidPcmSinkFormat(config->format)
-                    || !isValidPcmSinkChannelMask(config->channel_mask)) {
+                    || !isValidPcmSinkFormat(halConfig->format)
+                    || !isValidPcmSinkChannelMask(halConfig->channel_mask)) {
                 thread = new DirectOutputThread(this, outputStream, *output, mSystemReady);
                 ALOGV("openOutput_l() created direct output: ID %d thread %p",
                       *output, thread.get());
@@ -2644,7 +2893,7 @@ sp<AudioFlinger::ThreadBase> AudioFlinger::openOutput_l(audio_module_handle_t mo
         }
     }
 
-    return 0;
+    return nullptr;
 }
 
 status_t AudioFlinger::openOutput(const media::OpenOutputRequest& request,
@@ -2652,8 +2901,10 @@ status_t AudioFlinger::openOutput(const media::OpenOutputRequest& request,
 {
     audio_module_handle_t module = VALUE_OR_RETURN_STATUS(
             aidl2legacy_int32_t_audio_module_handle_t(request.module));
-    audio_config_t config = VALUE_OR_RETURN_STATUS(
-            aidl2legacy_AudioConfig_audio_config_t(request.config));
+    audio_config_t halConfig = VALUE_OR_RETURN_STATUS(
+            aidl2legacy_AudioConfig_audio_config_t(request.halConfig, false /*isInput*/));
+    audio_config_base_t mixerConfig = VALUE_OR_RETURN_STATUS(
+            aidl2legacy_AudioConfigBase_audio_config_base_t(request.mixerConfig, false/*isInput*/));
     sp<DeviceDescriptorBase> device = VALUE_OR_RETURN_STATUS(
             aidl2legacy_DeviceDescriptorBase(request.device));
     audio_output_flags_t flags = VALUE_OR_RETURN_STATUS(
@@ -2666,9 +2917,9 @@ status_t AudioFlinger::openOutput(const media::OpenOutputRequest& request,
               "Channels %#x, flags %#x",
               this, module,
               device->toString().c_str(),
-              config.sample_rate,
-              config.format,
-              config.channel_mask,
+              halConfig.sample_rate,
+              halConfig.format,
+              halConfig.channel_mask,
               flags);
 
     audio_devices_t deviceType = device->type();
@@ -2680,7 +2931,8 @@ status_t AudioFlinger::openOutput(const media::OpenOutputRequest& request,
 
     Mutex::Autolock _l(mLock);
 
-    sp<ThreadBase> thread = openOutput_l(module, &output, &config, deviceType, address, flags);
+    sp<ThreadBase> thread = openOutput_l(module, &output, &halConfig,
+            &mixerConfig, deviceType, address, flags);
     if (thread != 0) {
         if ((flags & AUDIO_OUTPUT_FLAG_MMAP_NOIRQ) == 0) {
             PlaybackThread *playbackThread = (PlaybackThread *)thread.get();
@@ -2705,7 +2957,8 @@ status_t AudioFlinger::openOutput(const media::OpenOutputRequest& request,
             mmapThread->ioConfigChanged(AUDIO_OUTPUT_OPENED);
         }
         response->output = VALUE_OR_RETURN_STATUS(legacy2aidl_audio_io_handle_t_int32_t(output));
-        response->config = VALUE_OR_RETURN_STATUS(legacy2aidl_audio_config_t_AudioConfig(config));
+        response->config = VALUE_OR_RETURN_STATUS(
+                legacy2aidl_audio_config_t_AudioConfig(halConfig, false /*isInput*/));
         response->latencyMs = VALUE_OR_RETURN_STATUS(convertIntegral<int32_t>(latencyMs));
         response->flags = VALUE_OR_RETURN_STATUS(
                 legacy2aidl_audio_output_flags_t_int32_t_mask(flags));
@@ -2791,9 +3044,7 @@ status_t AudioFlinger::closeOutput_nonvirtual(audio_io_handle_t output)
             mMmapThreads.removeItem(output);
             ALOGD("closing mmapThread %p", mmapThread.get());
         }
-        const sp<AudioIoDescriptor> ioDesc = new AudioIoDescriptor();
-        ioDesc->mIoHandle = output;
-        ioConfigChanged(AUDIO_OUTPUT_CLOSED, ioDesc);
+        ioConfigChanged(AUDIO_OUTPUT_CLOSED, sp<AudioIoDescriptor>::make(output));
         mPatchPanel.notifyStreamClosed(output);
     }
     // The thread entity (active unit of execution) is no longer running here,
@@ -2866,16 +3117,16 @@ status_t AudioFlinger::openInput(const media::OpenInputRequest& request,
 {
     Mutex::Autolock _l(mLock);
 
-    if (request.device.type == AUDIO_DEVICE_NONE) {
+    AudioDeviceTypeAddr device = VALUE_OR_RETURN_STATUS(
+            aidl2legacy_AudioDeviceTypeAddress(request.device));
+    if (device.mType == AUDIO_DEVICE_NONE) {
         return BAD_VALUE;
     }
 
     audio_io_handle_t input = VALUE_OR_RETURN_STATUS(
             aidl2legacy_int32_t_audio_io_handle_t(request.input));
     audio_config_t config = VALUE_OR_RETURN_STATUS(
-            aidl2legacy_AudioConfig_audio_config_t(request.config));
-    AudioDeviceTypeAddr device = VALUE_OR_RETURN_STATUS(
-            aidl2legacy_AudioDeviceTypeAddress(request.device));
+            aidl2legacy_AudioConfig_audio_config_t(request.config, true /*isInput*/));
 
     sp<ThreadBase> thread = openInput_l(
             VALUE_OR_RETURN_STATUS(aidl2legacy_int32_t_audio_module_handle_t(request.module)),
@@ -2883,13 +3134,14 @@ status_t AudioFlinger::openInput(const media::OpenInputRequest& request,
             &config,
             device.mType,
             device.address().c_str(),
-            VALUE_OR_RETURN_STATUS(aidl2legacy_AudioSourceType_audio_source_t(request.source)),
+            VALUE_OR_RETURN_STATUS(aidl2legacy_AudioSource_audio_source_t(request.source)),
             VALUE_OR_RETURN_STATUS(aidl2legacy_int32_t_audio_input_flags_t_mask(request.flags)),
             AUDIO_DEVICE_NONE,
             String8{});
 
     response->input = VALUE_OR_RETURN_STATUS(legacy2aidl_audio_io_handle_t_int32_t(input));
-    response->config = VALUE_OR_RETURN_STATUS(legacy2aidl_audio_config_t_AudioConfig(config));
+    response->config = VALUE_OR_RETURN_STATUS(
+            legacy2aidl_audio_config_t_AudioConfig(config, true /*isInput*/));
     response->device = request.device;
 
     if (thread != 0) {
@@ -2952,8 +3204,8 @@ sp<AudioFlinger::ThreadBase> AudioFlinger::openInput_l(audio_module_handle_t mod
         audio_is_linear_pcm(config->format) &&
         audio_is_linear_pcm(halconfig.format) &&
         (halconfig.sample_rate <= AUDIO_RESAMPLER_DOWN_RATIO_MAX * config->sample_rate) &&
-        (audio_channel_count_from_in_mask(halconfig.channel_mask) <= FCC_8) &&
-        (audio_channel_count_from_in_mask(config->channel_mask) <= FCC_8)) {
+        (audio_channel_count_from_in_mask(halconfig.channel_mask) <= FCC_LIMIT) &&
+        (audio_channel_count_from_in_mask(config->channel_mask) <= FCC_LIMIT)) {
         // FIXME describe the change proposed by HAL (save old values so we can log them here)
         ALOGV("openInput_l() reopening with proposed sampling rate and channel mask");
         inStream.clear();
@@ -3051,9 +3303,7 @@ status_t AudioFlinger::closeInput_nonvirtual(audio_io_handle_t input)
             dumpToThreadLog_l(mmapThread);
             mMmapThreads.removeItem(input);
         }
-        const sp<AudioIoDescriptor> ioDesc = new AudioIoDescriptor();
-        ioDesc->mIoHandle = input;
-        ioConfigChanged(AUDIO_INPUT_CLOSED, ioDesc);
+        ioConfigChanged(AUDIO_INPUT_CLOSED, sp<AudioIoDescriptor>::make(input));
     }
     // FIXME: calling thread->exit() without mLock held should not be needed anymore now that
     // we have a different lock for notification client
@@ -3441,6 +3691,100 @@ AudioFlinger::ThreadBase *AudioFlinger::hapticPlaybackThread_l() const {
     return nullptr;
 }
 
+void AudioFlinger::updateSecondaryOutputsForTrack_l(
+        PlaybackThread::Track* track,
+        PlaybackThread* thread,
+        const std::vector<audio_io_handle_t> &secondaryOutputs) const {
+    TeePatches teePatches;
+    for (audio_io_handle_t secondaryOutput : secondaryOutputs) {
+        PlaybackThread *secondaryThread = checkPlaybackThread_l(secondaryOutput);
+        if (secondaryThread == nullptr) {
+            ALOGE("no playback thread found for secondary output %d", thread->id());
+            continue;
+        }
+
+        size_t sourceFrameCount = thread->frameCount() * track->sampleRate()
+                                  / thread->sampleRate();
+        size_t sinkFrameCount = secondaryThread->frameCount() * track->sampleRate()
+                                  / secondaryThread->sampleRate();
+        // If the secondary output has just been opened, the first secondaryThread write
+        // will not block as it will fill the empty startup buffer of the HAL,
+        // so a second sink buffer needs to be ready for the immediate next blocking write.
+        // Additionally, have a margin of one main thread buffer as the scheduling jitter
+        // can reorder the writes (eg if thread A&B have the same write intervale,
+        // the scheduler could schedule AB...BA)
+        size_t frameCountToBeReady = 2 * sinkFrameCount + sourceFrameCount;
+        // Total secondary output buffer must be at least as the read frames plus
+        // the margin of a few buffers on both sides in case the
+        // threads scheduling has some jitter.
+        // That value should not impact latency as the secondary track is started before
+        // its buffer is full, see frameCountToBeReady.
+        size_t frameCount = frameCountToBeReady + 2 * (sourceFrameCount + sinkFrameCount);
+        // The frameCount should also not be smaller than the secondary thread min frame
+        // count
+        size_t minFrameCount = AudioSystem::calculateMinFrameCount(
+                    [&] { Mutex::Autolock _l(secondaryThread->mLock);
+                          return secondaryThread->latency_l(); }(),
+                    secondaryThread->mNormalFrameCount,
+                    secondaryThread->mSampleRate,
+                    track->sampleRate(),
+                    track->getSpeed());
+        frameCount = std::max(frameCount, minFrameCount);
+
+        using namespace std::chrono_literals;
+        auto inChannelMask = audio_channel_mask_out_to_in(track->channelMask());
+        if (inChannelMask == AUDIO_CHANNEL_INVALID) {
+            // The downstream PatchTrack has the proper output channel mask,
+            // so if there is no input channel mask equivalent, we can just
+            // use an index mask here to create the PatchRecord.
+            inChannelMask = audio_channel_mask_out_to_in_index_mask(track->channelMask());
+        }
+        sp patchRecord = new RecordThread::PatchRecord(nullptr /* thread */,
+                                                       track->sampleRate(),
+                                                       inChannelMask,
+                                                       track->format(),
+                                                       frameCount,
+                                                       nullptr /* buffer */,
+                                                       (size_t)0 /* bufferSize */,
+                                                       AUDIO_INPUT_FLAG_DIRECT,
+                                                       0ns /* timeout */);
+        status_t status = patchRecord->initCheck();
+        if (status != NO_ERROR) {
+            ALOGE("Secondary output patchRecord init failed: %d", status);
+            continue;
+        }
+
+        // TODO: We could check compatibility of the secondaryThread with the PatchTrack
+        // for fast usage: thread has fast mixer, sample rate matches, etc.;
+        // for now, we exclude fast tracks by removing the Fast flag.
+        const audio_output_flags_t outputFlags =
+                (audio_output_flags_t)(track->getOutputFlags() & ~AUDIO_OUTPUT_FLAG_FAST);
+        sp patchTrack = new PlaybackThread::PatchTrack(secondaryThread,
+                                                       track->streamType(),
+                                                       track->sampleRate(),
+                                                       track->channelMask(),
+                                                       track->format(),
+                                                       frameCount,
+                                                       patchRecord->buffer(),
+                                                       patchRecord->bufferSize(),
+                                                       outputFlags,
+                                                       0ns /* timeout */,
+                                                       frameCountToBeReady);
+        status = patchTrack->initCheck();
+        if (status != NO_ERROR) {
+            ALOGE("Secondary output patchTrack init failed: %d", status);
+            continue;
+        }
+        teePatches.push_back({patchRecord, patchTrack});
+        secondaryThread->addPatchTrack(patchTrack);
+        // In case the downstream patchTrack on the secondaryThread temporarily outlives
+        // our created track, ensure the corresponding patchRecord is still alive.
+        patchTrack->setPeerProxy(patchRecord, true /* holdReference */);
+        patchRecord->setPeerProxy(patchTrack, false /* holdReference */);
+    }
+    track->setTeePatches(std::move(teePatches));
+}
+
 sp<AudioFlinger::SyncEvent> AudioFlinger::createSyncEvent(AudioSystem::sync_event_t type,
                                     audio_session_t triggerSession,
                                     audio_session_t listenerSession,
@@ -3577,7 +3921,7 @@ status_t AudioFlinger::createEffect(const media::CreateEffectRequest& request,
     const int32_t priority = request.priority;
     const AudioDeviceTypeAddr device = VALUE_OR_RETURN_STATUS(
             aidl2legacy_AudioDeviceTypeAddress(request.device));
-    Identity adjIdentity = request.identity;
+    AttributionSourceState adjAttributionSource = request.attributionSource;
     const audio_session_t sessionId = VALUE_OR_RETURN_STATUS(
             aidl2legacy_int32_t_audio_session_t(request.sessionId));
     audio_io_handle_t io = VALUE_OR_RETURN_STATUS(
@@ -3595,19 +3939,21 @@ status_t AudioFlinger::createEffect(const media::CreateEffectRequest& request,
 
     // TODO b/182392553: refactor or make clearer
     const uid_t callingUid = IPCThreadState::self()->getCallingUid();
-    adjIdentity.uid = VALUE_OR_RETURN_STATUS(legacy2aidl_uid_t_int32_t(callingUid));
-    pid_t currentPid = VALUE_OR_RETURN_STATUS(aidl2legacy_int32_t_pid_t(adjIdentity.pid));
-    if (currentPid == -1 || !isAudioServerOrMediaServerUid(callingUid)) {
+    adjAttributionSource.uid = VALUE_OR_RETURN_STATUS(legacy2aidl_uid_t_int32_t(callingUid));
+    pid_t currentPid = VALUE_OR_RETURN_STATUS(aidl2legacy_int32_t_pid_t(adjAttributionSource.pid));
+    if (currentPid == -1 || !isAudioServerOrMediaServerOrSystemServerOrRootUid(callingUid)) {
         const pid_t callingPid = IPCThreadState::self()->getCallingPid();
         ALOGW_IF(currentPid != -1 && currentPid != callingPid,
                  "%s uid %d pid %d tried to pass itself off as pid %d",
                  __func__, callingUid, callingPid, currentPid);
-        adjIdentity.pid = VALUE_OR_RETURN_STATUS(legacy2aidl_pid_t_int32_t(callingPid));
+        adjAttributionSource.pid = VALUE_OR_RETURN_STATUS(legacy2aidl_pid_t_int32_t(callingPid));
         currentPid = callingPid;
     }
+    adjAttributionSource = AudioFlinger::checkAttributionSourcePackage(adjAttributionSource);
 
     ALOGV("createEffect pid %d, effectClient %p, priority %d, sessionId %d, io %d, factory %p",
-          adjIdentity.pid, effectClient.get(), priority, sessionId, io, mEffectsFactoryHal.get());
+          adjAttributionSource.pid, effectClient.get(), priority, sessionId, io,
+          mEffectsFactoryHal.get());
 
     if (mEffectsFactoryHal == 0) {
         ALOGE("%s: no effects factory hal", __func__);
@@ -3623,19 +3969,26 @@ status_t AudioFlinger::createEffect(const media::CreateEffectRequest& request,
             goto Exit;
         }
     } else if (sessionId == AUDIO_SESSION_OUTPUT_STAGE) {
-        if (!isAudioServerUid(callingUid)) {
-            ALOGE("%s: only APM can create using AUDIO_SESSION_OUTPUT_STAGE", __func__);
-            lStatus = PERMISSION_DENIED;
-            goto Exit;
-        }
-
         if (io == AUDIO_IO_HANDLE_NONE) {
             ALOGE("%s: APM must specify output when using AUDIO_SESSION_OUTPUT_STAGE", __func__);
             lStatus = BAD_VALUE;
             goto Exit;
         }
+        PlaybackThread *thread = checkPlaybackThread_l(io);
+        if (thread == nullptr) {
+            ALOGE("%s: invalid output %d specified for AUDIO_SESSION_OUTPUT_STAGE", __func__, io);
+            lStatus = BAD_VALUE;
+            goto Exit;
+        }
+        if (!modifyDefaultAudioEffectsAllowed(adjAttributionSource)
+                && !isAudioServerUid(callingUid)) {
+            ALOGE("%s: effect on AUDIO_SESSION_OUTPUT_STAGE not granted for uid %d",
+                    __func__, callingUid);
+            lStatus = PERMISSION_DENIED;
+            goto Exit;
+        }
     } else if (sessionId == AUDIO_SESSION_DEVICE) {
-        if (!modifyDefaultAudioEffectsAllowed(adjIdentity)) {
+        if (!modifyDefaultAudioEffectsAllowed(adjAttributionSource)) {
             ALOGE("%s: device effect permission denied for uid %d", __func__, callingUid);
             lStatus = PERMISSION_DENIED;
             goto Exit;
@@ -3680,7 +4033,7 @@ status_t AudioFlinger::createEffect(const media::CreateEffectRequest& request,
         // check recording permission for visualizer
         if ((memcmp(&descOut.type, SL_IID_VISUALIZATION, sizeof(effect_uuid_t)) == 0) &&
             // TODO: Do we need to start/stop op - i.e. is there recording being performed?
-            !recordingAllowed(adjIdentity)) {
+            !recordingAllowed(adjAttributionSource)) {
             lStatus = PERMISSION_DENIED;
             goto Exit;
         }
@@ -3692,6 +4045,15 @@ status_t AudioFlinger::createEffect(const media::CreateEffectRequest& request,
                         || sessionId == AUDIO_SESSION_OUTPUT_STAGE)) {
             // haptic-generating effect is only valid when the session id is a general session id
             lStatus = INVALID_OPERATION;
+            goto Exit;
+        }
+
+        // Only audio policy service can create a spatializer effect
+        if ((memcmp(&descOut.type, FX_IID_SPATIALIZER, sizeof(effect_uuid_t)) == 0) &&
+            (callingUid != AID_AUDIOSERVER || currentPid != getpid())) {
+            ALOGW("%s: attempt to create a spatializer effect from uid/pid %d/%d",
+                    __func__, callingUid, currentPid);
+            lStatus = PERMISSION_DENIED;
             goto Exit;
         }
 
@@ -3710,7 +4072,7 @@ status_t AudioFlinger::createEffect(const media::CreateEffectRequest& request,
             ALOGV("%s device type %#x address %s", __func__, device.mType, device.getAddress());
             handle = mDeviceEffectManager.createEffect_l(
                     &descOut, device, client, effectClient, mPatchPanel.patches_l(),
-                    &enabledOut, &lStatus, probe);
+                    &enabledOut, &lStatus, probe, request.notifyFramesProcessed);
             if (lStatus != NO_ERROR && lStatus != ALREADY_EXISTS) {
                 // remove local strong reference to Client with mClientLock held
                 Mutex::Autolock _cl(mClientLock);
@@ -3763,7 +4125,8 @@ status_t AudioFlinger::createEffect(const media::CreateEffectRequest& request,
                 io = mPlaybackThreads.keyAt(0);
             }
             ALOGV("createEffect() got io %d for effect %s", io, descOut.name);
-        } else if (checkPlaybackThread_l(io) != nullptr) {
+        } else if (checkPlaybackThread_l(io) != nullptr
+                        && sessionId != AUDIO_SESSION_OUTPUT_STAGE) {
             // allow only one effect chain per sessionId on mPlaybackThreads.
             for (size_t i = 0; i < mPlaybackThreads.size(); i++) {
                 const audio_io_handle_t checkIo = mPlaybackThreads.keyAt(i);
@@ -3829,7 +4192,8 @@ status_t AudioFlinger::createEffect(const media::CreateEffectRequest& request,
             }
         }
         handle = thread->createEffect_l(client, effectClient, priority, sessionId,
-                                        &descOut, &enabledOut, &lStatus, pinned, probe);
+                                        &descOut, &enabledOut, &lStatus, pinned, probe,
+                                        request.notifyFramesProcessed);
         if (lStatus != NO_ERROR && lStatus != ALREADY_EXISTS) {
             // remove local strong reference to Client with mClientLock held
             Mutex::Autolock _cl(mClientLock);
@@ -3847,6 +4211,12 @@ status_t AudioFlinger::createEffect(const media::CreateEffectRequest& request,
 
 Register:
     if (!probe && (lStatus == NO_ERROR || lStatus == ALREADY_EXISTS)) {
+        if (lStatus == ALREADY_EXISTS) {
+            response->alreadyExists = true;
+            lStatus = NO_ERROR;
+        } else {
+            response->alreadyExists = false;
+        }
         // Check CPU and memory usage
         sp<EffectBase> effect = handle->effect().promote();
         if (effect != nullptr) {
@@ -3939,47 +4309,87 @@ status_t AudioFlinger::moveEffectChain_l(audio_session_t sessionId,
     // so that a new chain is created with correct parameters when first effect is added. This is
     // otherwise unnecessary as removeEffect_l() will remove the chain when last effect is
     // removed.
+    // TODO(b/216875016): consider holding the effect chain locks for the duration of the move.
     srcThread->removeEffectChain_l(chain);
 
     // transfer all effects one by one so that new effect chain is created on new thread with
     // correct buffer sizes and audio parameters and effect engines reconfigured accordingly
     sp<EffectChain> dstChain;
-    uint32_t strategy = 0; // prevent compiler warning
     sp<EffectModule> effect = chain->getEffectFromId_l(0);
     Vector< sp<EffectModule> > removed;
     status_t status = NO_ERROR;
-    while (effect != 0) {
+    std::string errorString;
+    while (effect != nullptr) {
         srcThread->removeEffect_l(effect);
         removed.add(effect);
         status = dstThread->addEffect_l(effect);
         if (status != NO_ERROR) {
+            errorString = StringPrintf(
+                    "cannot add effect %p to destination thread", effect.get());
             break;
         }
-        // removeEffect_l() has stopped the effect if it was active so it must be restarted
-        if (effect->state() == EffectModule::ACTIVE ||
-                effect->state() == EffectModule::STOPPING) {
-            effect->start();
-        }
         // if the move request is not received from audio policy manager, the effect must be
-        // re-registered with the new strategy and output
-        if (dstChain == 0) {
-            dstChain = effect->callback()->chain().promote();
-            if (dstChain == 0) {
-                ALOGW("moveEffectChain_l() cannot get chain from effect %p", effect.get());
+        // re-registered with the new strategy and output.
+
+        // We obtain the dstChain once the effect is on the new thread.
+        if (dstChain == nullptr) {
+            dstChain = effect->getCallback()->chain().promote();
+            if (dstChain == nullptr) {
+                errorString = StringPrintf("cannot get chain from effect %p", effect.get());
                 status = NO_INIT;
                 break;
             }
-            strategy = dstChain->strategy();
         }
         effect = chain->getEffectFromId_l(0);
     }
 
+    size_t restored = 0;
     if (status != NO_ERROR) {
-        for (size_t i = 0; i < removed.size(); i++) {
-            srcThread->addEffect_l(removed[i]);
+        dstChain.clear(); // dstChain is now from the srcThread (could be recreated).
+        for (const auto& effect : removed) {
+            dstThread->removeEffect_l(effect); // Note: Depending on error location, the last
+                                               // effect may not have been placed on dstThread.
+            if (srcThread->addEffect_l(effect) == NO_ERROR) {
+                ++restored;
+                if (dstChain == nullptr) {
+                    dstChain = effect->getCallback()->chain().promote();
+                }
+            }
         }
     }
 
+    // After all the effects have been moved to new thread (or put back) we restart the effects
+    // because removeEffect_l() has stopped the effect if it is currently active.
+    size_t started = 0;
+    if (dstChain != nullptr && !removed.empty()) {
+        // If we do not take the dstChain lock, it is possible that processing is ongoing
+        // while we are starting the effect.  This can cause glitches with volume,
+        // see b/202360137.
+        dstChain->lock();
+        for (const auto& effect : removed) {
+            if (effect->state() == EffectModule::ACTIVE ||
+                    effect->state() == EffectModule::STOPPING) {
+                ++started;
+                effect->start();
+            }
+        }
+        dstChain->unlock();
+    }
+
+    if (status != NO_ERROR) {
+        if (errorString.empty()) {
+            errorString = StringPrintf("%s: failed status %d", __func__, status);
+        }
+        ALOGW("%s: %s unsuccessful move of session %d from srcThread %p to dstThread %p "
+                "(%zu effects removed from srcThread, %zu effects restored to srcThread, "
+                "%zu effects started)",
+                __func__, errorString.c_str(), sessionId, srcThread, dstThread,
+                removed.size(), restored, started);
+    } else {
+        ALOGD("%s: successful move of session %d from srcThread %p to dstThread %p "
+                "(%zu effects moved, %zu effects started)",
+                __func__, sessionId, srcThread, dstThread, removed.size(), started);
+    }
     return status;
 }
 
@@ -4013,7 +4423,7 @@ status_t AudioFlinger::moveAuxEffectToIo(int EffectId,
             goto Exit;
         }
 
-        dstChain = effect->callback()->chain().promote();
+        dstChain = effect->getCallback()->chain().promote();
         if (dstChain == 0) {
             thread->addEffect_l(effect);
             status = INVALID_OPERATION;
@@ -4115,9 +4525,13 @@ bool AudioFlinger::updateOrphanEffectChains(const sp<AudioFlinger::EffectModule>
 
 // ----------------------------------------------------------------------------
 
-status_t AudioFlinger::onPreTransact(
-        TransactionCode code, const Parcel& /* data */, uint32_t /* flags */)
-{
+status_t AudioFlinger::onTransactWrapper(TransactionCode code,
+                                         const Parcel& data,
+                                         uint32_t flags,
+                                         const std::function<status_t()>& delegate) {
+    (void) data;
+    (void) flags;
+
     // make sure transactions reserved to AudioPolicyManager do not come from other processes
     switch (code) {
         case TransactionCode::SET_STREAM_VOLUME:
@@ -4140,6 +4554,10 @@ status_t AudioFlinger::onPreTransact(
         case TransactionCode::LIST_AUDIO_PATCHES:
         case TransactionCode::SET_AUDIO_PORT_CONFIG:
         case TransactionCode::SET_RECORD_SILENCED:
+        case TransactionCode::AUDIO_POLICY_READY:
+        case TransactionCode::SET_DEVICE_CONNECTED_STATE:
+        case TransactionCode::SET_REQUESTED_LATENCY_MODE:
+        case TransactionCode::GET_SUPPORTED_LATENCY_MODES:
             ALOGW("%s: transaction %d received from PID %d",
                   __func__, code, IPCThreadState::self()->getCallingPid());
             // return status only for non void methods
@@ -4150,6 +4568,7 @@ status_t AudioFlinger::onPreTransact(
                 default:
                     return INVALID_OPERATION;
             }
+            // Fail silently in these cases.
             return OK;
         default:
             break;
@@ -4165,7 +4584,8 @@ status_t AudioFlinger::onPreTransact(
         case TransactionCode::SET_LOW_RAM_DEVICE:
         case TransactionCode::SYSTEM_READY:
         case TransactionCode::SET_AUDIO_HAL_PIDS:
-        case TransactionCode::SET_VIBRATOR_INFOS: {
+        case TransactionCode::SET_VIBRATOR_INFOS:
+        case TransactionCode::UPDATE_SECONDARY_OUTPUTS: {
             if (!isServiceUid(IPCThreadState::self()->getCallingUid())) {
                 ALOGW("%s: transaction %d received from PID %d unauthorized UID %d",
                       __func__, code, IPCThreadState::self()->getCallingPid(),
@@ -4177,6 +4597,7 @@ status_t AudioFlinger::onPreTransact(
                     default:
                         return INVALID_OPERATION;
                 }
+                // Fail silently in these cases.
                 return OK;
             }
         } break;
@@ -4204,9 +4625,22 @@ status_t AudioFlinger::onPreTransact(
             break;
     }
 
-    std::string tag("IAudioFlinger command " +
-                    std::to_string(static_cast<std::underlying_type_t<TransactionCode>>(code)));
-    TimeCheck check(tag.c_str());
+    const std::string methodName = getIAudioFlingerStatistics().getMethodForCode(code);
+    mediautils::TimeCheck check(
+            std::string("IAudioFlinger::").append(methodName),
+            [code, methodName](bool timeout, float elapsedMs) { // don't move methodName.
+        if (timeout) {
+            mediametrics::LogItem(mMetricsId)
+                .set(AMEDIAMETRICS_PROP_EVENT, AMEDIAMETRICS_PROP_EVENT_VALUE_TIMEOUT)
+                .set(AMEDIAMETRICS_PROP_METHODCODE, int64_t(code))
+                .set(AMEDIAMETRICS_PROP_METHODNAME, methodName.c_str())
+                .record();
+        } else {
+            getIAudioFlingerStatistics().event(code, elapsedMs);
+        }
+    }, mediautils::TimeCheck::kDefaultTimeoutDuration,
+    mediautils::TimeCheck::kDefaultSecondChanceDuration,
+    true /* crashOnTimeout */);
 
     // Make sure we connect to Audio Policy Service before calling into AudioFlinger:
     //  - AudioFlinger can call into Audio Policy Service with its global mutex held
@@ -4218,7 +4652,7 @@ status_t AudioFlinger::onPreTransact(
         AudioSystem::get_audio_policy_service();
     }
 
-    return OK;
+    return delegate();
 }
 
 } // namespace android

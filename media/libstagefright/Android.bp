@@ -109,6 +109,7 @@ cc_library_shared {
 
     srcs: [
         "CodecBase.cpp",
+        "DataConverter.cpp",
         "FrameRenderTracker.cpp",
         "MediaCodecListWriter.cpp",
         "SkipCutBuffer.cpp",
@@ -125,6 +126,7 @@ cc_library_shared {
     ],
 
     shared_libs: [
+        "libaudioutils",
         "libgui",
         "libhidlallocatorutils",
         "liblog",
@@ -251,6 +253,40 @@ cc_library_shared {
         ],
     },
 }
+
+cc_library_shared {
+    name: "libstagefright_surface_utils",
+
+    srcs: [
+        "SurfaceUtils.cpp",
+    ],
+
+    shared_libs: [
+        "libgui",
+        "liblog",
+        "libui",
+        "libutils",
+    ],
+
+    export_include_dirs: [
+        "include",
+    ],
+
+    cflags: [
+        "-Wno-multichar",
+        "-Werror",
+        "-Wall",
+    ],
+
+    sanitize: {
+        cfi: true,
+        misc_undefined: [
+            "unsigned-integer-overflow",
+            "signed-integer-overflow",
+        ],
+    },
+}
+
 cc_library {
     name: "libstagefright",
 
@@ -266,7 +302,6 @@ cc_library {
         "CallbackMediaSource.cpp",
         "CameraSource.cpp",
         "CameraSourceTimeLapse.cpp",
-        "DataConverter.cpp",
         "FrameDecoder.cpp",
         "HevcUtils.cpp",
         "InterfaceUtils.cpp",
@@ -338,8 +373,9 @@ cc_library {
         "android.hardware.cas.native@1.0",
         "android.hardware.drm@1.0",
         "android.hardware.media.omx@1.0",
-        "media_permission-aidl-cpp",
+        "framework-permission-aidl-cpp",
         "libaudioclient_aidl_conversion",
+        "packagemanager_aidl-cpp",
     ],
 
     static_libs: [
@@ -352,7 +388,7 @@ cc_library {
         "libogg",
         "libwebm",
         "libstagefright_id3",
-        "media_permission-aidl-cpp",
+        "framework-permission-aidl-cpp",
         "libmediandk_format",
         "libmedia_ndkformatpriv",
     ],
@@ -370,7 +406,7 @@ cc_library {
         "libhidlmemory",
         "libmedia",
         "android.hidl.allocator@1.0",
-        "media_permission-aidl-cpp",
+        "framework-permission-aidl-cpp",
     ],
 
     export_include_dirs: [

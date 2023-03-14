@@ -16,13 +16,16 @@
 
 //#define LOG_NDEBUG 0
 #define LOG_TAG "StagefrightRecorder"
+#define ATRACE_TAG ATRACE_TAG_VIDEO
+#include <utils/Trace.h>
 #include <inttypes.h>
 // TODO/workaround: including base logging now as it conflicts with ADebug.h
 // and it must be included first.
 #include <android-base/logging.h>
 #include <utils/Log.h>
 
-#include "WebmWriter.h"
+#include <webm/WebmWriter.h>
+
 #include "StagefrightRecorder.h"
 
 #include <algorithm>
@@ -64,7 +67,7 @@
 
 #include <system/audio.h>
 
-#include "ARTPWriter.h"
+#include <media/stagefright/rtsp/ARTPWriter.h>
 
 namespace android {
 
@@ -116,8 +119,8 @@ static void addBatteryData(uint32_t params) {
 }
 
 
-StagefrightRecorder::StagefrightRecorder(const Identity& clientIdentity)
-    : MediaRecorderBase(clientIdentity),
+StagefrightRecorder::StagefrightRecorder(const AttributionSourceState& client)
+    : MediaRecorderBase(client),
       mWriter(NULL),
       mOutputFd(-1),
       mAudioSource((audio_source_t)AUDIO_SOURCE_CNT), // initialize with invalid value
@@ -126,6 +129,7 @@ StagefrightRecorder::StagefrightRecorder(const Identity& clientIdentity)
       mRTPCVOExtMap(-1),
       mRTPCVODegrees(0),
       mRTPSockDscp(0),
+      mRTPSockOptEcn(0),
       mRTPSockNetwork(0),
       mLastSeqNo(0),
       mStarted(false),
@@ -159,7 +163,7 @@ void StagefrightRecorder::updateMetrics() {
 
     // we run as part of the media player service; what we really want to
     // know is the app which requested the recording.
-    mMetricsItem->setUid(VALUE_OR_FATAL(aidl2legacy_int32_t_uid_t(mClient.uid)));
+    mMetricsItem->setUid(VALUE_OR_FATAL(aidl2legacy_int32_t_uid_t(mAttributionSource.uid)));
 
     mMetricsItem->setCString(kRecorderLogSessionId, mLogSessionId.c_str());
 
@@ -907,6 +911,13 @@ status_t StagefrightRecorder::setSocketNetwork(int64_t networkHandle) {
     return OK;
 }
 
+status_t StagefrightRecorder::setParamRtpEcn(int32_t ecn) {
+    ALOGV("setParamRtpEcn: %d", ecn);
+
+    mRTPSockOptEcn = ecn;
+    return OK;
+}
+
 status_t StagefrightRecorder::requestIDRFrame() {
     status_t ret = BAD_VALUE;
     if (mVideoEncoderSource != NULL) {
@@ -1088,6 +1099,11 @@ status_t StagefrightRecorder::setParameter(
         if (safe_strtoi32(value.string(), &dscp)) {
             return setParamRtpDscp(dscp);
         }
+    } else if (key == "rtp-param-set-socket-ecn") {
+        int32_t targetEcn;
+        if (safe_strtoi32(value.string(), &targetEcn)) {
+            return setParamRtpEcn(targetEcn);
+        }
     } else if (key == "rtp-param-set-socket-network") {
         int64_t networkHandle;
         if (safe_strtoi64(value.string(), &networkHandle)) {
@@ -1144,7 +1160,8 @@ status_t StagefrightRecorder::setListener(const sp<IMediaRecorderClient> &listen
 
 status_t StagefrightRecorder::setClientName(const String16& clientName) {
 
-    mClient.packageName = VALUE_OR_RETURN_STATUS(legacy2aidl_String16_string(clientName));
+    mAttributionSource.packageName = VALUE_OR_RETURN_STATUS(
+            legacy2aidl_String16_string(clientName));
 
     return OK;
 }
@@ -1268,6 +1285,9 @@ status_t StagefrightRecorder::start() {
             if (mRTPSockDscp > 0) {
                 meta->setInt32(kKeyRtpDscp, mRTPSockDscp);
             }
+            if (mRTPSockOptEcn > 0) {
+                meta->setInt32(kKeyRtpEcn, mRTPSockOptEcn);
+            }
 
             status = mWriter->start(meta.get());
             break;
@@ -1355,7 +1375,7 @@ sp<MediaCodecSource> StagefrightRecorder::createAudioSource() {
     sp<AudioSource> audioSource =
         new AudioSource(
                 &attr,
-                mClient,
+                mAttributionSource,
                 sourceSampleRate,
                 mAudioChannels,
                 mSampleRate,
@@ -1855,6 +1875,7 @@ void StagefrightRecorder::clipVideoFrameHeight() {
 // Set up the appropriate MediaSource depending on the chosen option
 status_t StagefrightRecorder::setupMediaSource(
                       sp<MediaSource> *mediaSource) {
+    ATRACE_CALL();
     if (mVideoSource == VIDEO_SOURCE_DEFAULT
             || mVideoSource == VIDEO_SOURCE_CAMERA) {
         sp<CameraSource> cameraSource;
@@ -1880,10 +1901,10 @@ status_t StagefrightRecorder::setupCameraSource(
     Size videoSize;
     videoSize.width = mVideoWidth;
     videoSize.height = mVideoHeight;
-    uid_t uid = VALUE_OR_RETURN_STATUS(aidl2legacy_int32_t_uid_t(mClient.uid));
-    pid_t pid = VALUE_OR_RETURN_STATUS(aidl2legacy_int32_t_pid_t(mClient.pid));
+    uid_t uid = VALUE_OR_RETURN_STATUS(aidl2legacy_int32_t_uid_t(mAttributionSource.uid));
+    pid_t pid = VALUE_OR_RETURN_STATUS(aidl2legacy_int32_t_pid_t(mAttributionSource.pid));
     String16 clientName = VALUE_OR_RETURN_STATUS(
-        aidl2legacy_string_view_String16(mClient.packageName.value_or("")));
+        aidl2legacy_string_view_String16(mAttributionSource.packageName.value_or("")));
     if (mCaptureFpsEnable) {
         if (!(mCaptureFps > 0.)) {
             ALOGE("Invalid mCaptureFps value: %lf", mCaptureFps);
@@ -1935,6 +1956,7 @@ status_t StagefrightRecorder::setupCameraSource(
 status_t StagefrightRecorder::setupVideoEncoder(
         const sp<MediaSource> &cameraSource,
         sp<MediaCodecSource> *source) {
+    ATRACE_CALL();
     source->clear();
 
     sp<AMessage> format = new AMessage();
@@ -1958,6 +1980,10 @@ status_t StagefrightRecorder::setupVideoEncoder(
 
         case VIDEO_ENCODER_HEVC:
             format->setString("mime", MEDIA_MIMETYPE_VIDEO_HEVC);
+            break;
+
+        case VIDEO_ENCODER_DOLBY_VISION:
+            format->setString("mime", MEDIA_MIMETYPE_VIDEO_DOLBY_VISION);
             break;
 
         default:
@@ -2113,6 +2139,7 @@ status_t StagefrightRecorder::setupVideoEncoder(
 }
 
 status_t StagefrightRecorder::setupAudioEncoder(const sp<MediaWriter>& writer) {
+    ATRACE_CALL();
     status_t status = BAD_VALUE;
     if (OK != (status = checkAudioEncoderCapabilities())) {
         return status;

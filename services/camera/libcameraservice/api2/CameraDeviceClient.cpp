@@ -51,12 +51,14 @@
 
 namespace android {
 using namespace camera2;
+using namespace camera3;
 using camera3::camera_stream_rotation_t::CAMERA_STREAM_ROTATION_0;
 
 CameraDeviceClientBase::CameraDeviceClientBase(
         const sp<CameraService>& cameraService,
         const sp<hardware::camera2::ICameraDeviceCallbacks>& remoteCallback,
         const String16& clientPackageName,
+        bool systemNativeClient,
         const std::optional<String16>& clientFeatureId,
         const String8& cameraId,
         int api1CameraId,
@@ -64,17 +66,20 @@ CameraDeviceClientBase::CameraDeviceClientBase(
         int sensorOrientation,
         int clientPid,
         uid_t clientUid,
-        int servicePid) :
+        int servicePid,
+        bool overrideToPortrait) :
     BasicClient(cameraService,
             IInterface::asBinder(remoteCallback),
             clientPackageName,
+            systemNativeClient,
             clientFeatureId,
             cameraId,
             cameraFacing,
             sensorOrientation,
             clientPid,
             clientUid,
-            servicePid),
+            servicePid,
+            overrideToPortrait),
     mRemoteCallback(remoteCallback) {
     // We don't need it for API2 clients, but Camera2ClientBase requires it.
     (void) api1CameraId;
@@ -85,19 +90,23 @@ CameraDeviceClientBase::CameraDeviceClientBase(
 CameraDeviceClient::CameraDeviceClient(const sp<CameraService>& cameraService,
         const sp<hardware::camera2::ICameraDeviceCallbacks>& remoteCallback,
         const String16& clientPackageName,
+        bool systemNativeClient,
         const std::optional<String16>& clientFeatureId,
         const String8& cameraId,
         int cameraFacing,
         int sensorOrientation,
         int clientPid,
         uid_t clientUid,
-        int servicePid) :
-    Camera2ClientBase(cameraService, remoteCallback, clientPackageName, clientFeatureId,
-                cameraId, /*API1 camera ID*/ -1,
-                cameraFacing, sensorOrientation, clientPid, clientUid, servicePid),
+        int servicePid,
+        bool overrideForPerfClass,
+        bool overrideToPortrait) :
+    Camera2ClientBase(cameraService, remoteCallback, clientPackageName, systemNativeClient,
+                clientFeatureId, cameraId, /*API1 camera ID*/ -1, cameraFacing, sensorOrientation,
+                clientPid, clientUid, servicePid, overrideForPerfClass, overrideToPortrait),
     mInputStream(),
     mStreamingRequestId(REQUEST_ID_NONE),
-    mRequestIdCounter(0) {
+    mRequestIdCounter(0),
+    mOverrideForPerfClass(overrideForPerfClass) {
 
     ATRACE_CALL();
     ALOGI("CameraDeviceClient %s: Opened", cameraId.string());
@@ -137,6 +146,40 @@ status_t CameraDeviceClient::initializeImpl(TProviderPtr providerPtr, const Stri
                 physicalKeysEntry.data.i32 + physicalKeysEntry.count);
     }
 
+    auto entry = deviceInfo.find(ANDROID_REQUEST_AVAILABLE_CAPABILITIES);
+    mDynamicProfileMap.emplace(
+            ANDROID_REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES_MAP_STANDARD,
+            ANDROID_REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES_MAP_STANDARD);
+    if (entry.count > 0) {
+        const auto it = std::find(entry.data.u8, entry.data.u8 + entry.count,
+                ANDROID_REQUEST_AVAILABLE_CAPABILITIES_DYNAMIC_RANGE_TEN_BIT);
+        if (it != entry.data.u8 + entry.count) {
+            entry = deviceInfo.find(ANDROID_REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES_MAP);
+            if (entry.count > 0 || ((entry.count % 3) != 0)) {
+                int64_t standardBitmap =
+                        ANDROID_REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES_MAP_STANDARD;
+                for (size_t i = 0; i < entry.count; i += 3) {
+                    if (entry.data.i64[i] !=
+                            ANDROID_REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES_MAP_STANDARD) {
+                        mDynamicProfileMap.emplace(entry.data.i64[i], entry.data.i64[i+1]);
+                        if ((entry.data.i64[i+1] == 0) || (entry.data.i64[i+1] &
+                                ANDROID_REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES_MAP_STANDARD)) {
+                            standardBitmap |= entry.data.i64[i];
+                        }
+                    } else {
+                        ALOGE("%s: Device %s includes unexpected profile entry: 0x%" PRIx64 "!",
+                                __FUNCTION__, mCameraIdStr.c_str(), entry.data.i64[i]);
+                    }
+                }
+                mDynamicProfileMap[ANDROID_REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES_MAP_STANDARD] =
+                        standardBitmap;
+            } else {
+                ALOGE("%s: Device %s supports 10-bit output but doesn't include a dynamic range"
+                        " profile map!", __FUNCTION__, mCameraIdStr.c_str());
+            }
+        }
+    }
+
     mProviderManager = providerPtr;
     // Cache physical camera ids corresponding to this device and also the high
     // resolution sensors in this device + physical camera ids
@@ -169,6 +212,7 @@ binder::Status CameraDeviceClient::insertGbpLocked(const sp<IGraphicBufferProduc
     int compositeIdx;
     int idx = mStreamMap.indexOfKey(IInterface::asBinder(gbp));
 
+    Mutex::Autolock l(mCompositeLock);
     // Trying to submit request with surface that wasn't created
     if (idx == NAME_NOT_FOUND) {
         ALOGE("%s: Camera %s: Tried to submit a request with a surface that"
@@ -294,6 +338,7 @@ binder::Status CameraDeviceClient::submitRequestList(
         SurfaceMap surfaceMap;
         Vector<int32_t> outputStreamIds;
         std::vector<std::string> requestedPhysicalIds;
+        int64_t dynamicProfileBitmap = 0;
         if (request.mSurfaceList.size() > 0) {
             for (const sp<Surface>& surface : request.mSurfaceList) {
                 if (surface == 0) continue;
@@ -310,6 +355,8 @@ binder::Status CameraDeviceClient::submitRequestList(
                     String8 requestedPhysicalId(
                             mConfiguredOutputs.valueAt(index).getPhysicalCameraId());
                     requestedPhysicalIds.push_back(requestedPhysicalId.string());
+                    dynamicProfileBitmap |=
+                            mConfiguredOutputs.valueAt(index).getDynamicRangeProfile();
                 } else {
                     ALOGW("%s: Output stream Id not found among configured outputs!", __FUNCTION__);
                 }
@@ -345,6 +392,41 @@ binder::Status CameraDeviceClient::submitRequestList(
                 String8 requestedPhysicalId(
                         mConfiguredOutputs.valueAt(index).getPhysicalCameraId());
                 requestedPhysicalIds.push_back(requestedPhysicalId.string());
+                dynamicProfileBitmap |=
+                        mConfiguredOutputs.valueAt(index).getDynamicRangeProfile();
+            }
+        }
+
+        if (dynamicProfileBitmap !=
+                    ANDROID_REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES_MAP_STANDARD) {
+            for (int i = ANDROID_REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES_MAP_STANDARD;
+                    i < ANDROID_REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES_MAP_MAX; i <<= 1) {
+                if ((dynamicProfileBitmap & i) == 0) {
+                    continue;
+                }
+
+                const auto& it = mDynamicProfileMap.find(i);
+                if (it != mDynamicProfileMap.end()) {
+                    if ((it->second == 0) ||
+                            ((it->second & dynamicProfileBitmap) == dynamicProfileBitmap)) {
+                        continue;
+                    } else {
+                        ALOGE("%s: Camera %s: Tried to submit a request with a surfaces that"
+                                " reference an unsupported dynamic range profile combination"
+                                " 0x%" PRIx64 "!", __FUNCTION__, mCameraIdStr.string(),
+                                dynamicProfileBitmap);
+                        return STATUS_ERROR(CameraService::ERROR_ILLEGAL_ARGUMENT,
+                                "Request targets an unsupported dynamic range profile"
+                                " combination");
+                    }
+                } else {
+                    ALOGE("%s: Camera %s: Tried to submit a request with a surface that"
+                            " references unsupported dynamic range profile 0x%x!",
+                            __FUNCTION__, mCameraIdStr.string(), i);
+                    return STATUS_ERROR(CameraService::ERROR_ILLEGAL_ARGUMENT,
+                            "Request targets 10-bit Surface with unsupported dynamic range"
+                            " profile");
+                }
             }
         }
 
@@ -376,6 +458,12 @@ binder::Status CameraDeviceClient::submitRequestList(
             }
 
             String8 physicalId(it.id.c_str());
+            bool hasTestPatternModePhysicalKey = std::find(mSupportedPhysicalRequestKeys.begin(),
+                    mSupportedPhysicalRequestKeys.end(), ANDROID_SENSOR_TEST_PATTERN_MODE) !=
+                    mSupportedPhysicalRequestKeys.end();
+            bool hasTestPatternDataPhysicalKey = std::find(mSupportedPhysicalRequestKeys.begin(),
+                    mSupportedPhysicalRequestKeys.end(), ANDROID_SENSOR_TEST_PATTERN_DATA) !=
+                    mSupportedPhysicalRequestKeys.end();
             if (physicalId != mDevice->getId()) {
                 auto found = std::find(requestedPhysicalIds.begin(), requestedPhysicalIds.end(),
                         it.id);
@@ -401,7 +489,8 @@ binder::Status CameraDeviceClient::submitRequestList(
                         }
                     }
 
-                    physicalSettingsList.push_back({it.id, filteredParams});
+                    physicalSettingsList.push_back({it.id, filteredParams,
+                            hasTestPatternModePhysicalKey, hasTestPatternDataPhysicalKey});
                 }
             } else {
                 physicalSettingsList.push_back({it.id, it.settings});
@@ -431,6 +520,17 @@ binder::Status CameraDeviceClient::submitRequestList(
 
         metadataRequestList.push_back(physicalSettingsList);
         surfaceMapList.push_back(surfaceMap);
+
+        // Save certain CaptureRequest settings
+        if (!request.mUserTag.empty()) {
+            mUserTag = request.mUserTag;
+        }
+        camera_metadata_entry entry =
+                physicalSettingsList.begin()->metadata.find(
+                        ANDROID_CONTROL_VIDEO_STABILIZATION_MODE);
+        if (entry.count == 1) {
+            mVideoStabilizationMode = entry.data.u8[0];
+        }
     }
     mRequestIdCounter++;
 
@@ -537,7 +637,7 @@ binder::Status CameraDeviceClient::endConfigure(int operatingMode,
         return STATUS_ERROR(CameraService::ERROR_DISCONNECTED, "Camera device no longer alive");
     }
 
-    res = camera3::SessionConfigurationUtils::checkOperatingMode(operatingMode, mDevice->info(),
+    res = SessionConfigurationUtils::checkOperatingMode(operatingMode, mDevice->info(),
             mCameraIdStr);
     if (!res.isOk()) {
         return res;
@@ -558,6 +658,7 @@ binder::Status CameraDeviceClient::endConfigure(int operatingMode,
         offlineStreamIds->clear();
         mDevice->getOfflineStreamIds(offlineStreamIds);
 
+        Mutex::Autolock l(mCompositeLock);
         for (size_t i = 0; i < mCompositeStreamMap.size(); ++i) {
             err = mCompositeStreamMap.valueAt(i)->configureStream();
             if (err != OK) {
@@ -616,7 +717,7 @@ binder::Status CameraDeviceClient::isSessionConfigurationSupported(
     }
 
     auto operatingMode = sessionConfiguration.getOperatingMode();
-    res = camera3::SessionConfigurationUtils::checkOperatingMode(operatingMode, mDevice->info(),
+    res = SessionConfigurationUtils::checkOperatingMode(operatingMode, mDevice->info(),
             mCameraIdStr);
     if (!res.isOk()) {
         return res;
@@ -627,26 +728,12 @@ binder::Status CameraDeviceClient::isSessionConfigurationSupported(
         ALOGE("%s: %s", __FUNCTION__, msg.string());
         return STATUS_ERROR(CameraService::ERROR_ILLEGAL_ARGUMENT, msg.string());
     }
-    hardware::camera::device::V3_7::StreamConfiguration streamConfiguration;
-    bool earlyExit = false;
-    metadataGetter getMetadata = [this](const String8 &id) {return mDevice->infoPhysical(id);};
-    std::vector<std::string> physicalCameraIds;
-    mProviderManager->isLogicalCamera(mCameraIdStr.string(), &physicalCameraIds);
-    res = camera3::SessionConfigurationUtils::convertToHALStreamCombination(sessionConfiguration,
-            mCameraIdStr, mDevice->info(), getMetadata, physicalCameraIds, streamConfiguration,
-            &earlyExit);
-    if (!res.isOk()) {
-        return res;
-    }
-
-    if (earlyExit) {
-        *status = false;
-        return binder::Status::ok();
-    }
 
     *status = false;
+    camera3::metadataGetter getMetadata = [this](const String8 &id, bool /*overrideForPerfClass*/) {
+          return mDevice->infoPhysical(id);};
     ret = mProviderManager->isSessionConfigurationSupported(mCameraIdStr.string(),
-            streamConfiguration, status);
+            sessionConfiguration, mOverrideForPerfClass, getMetadata, status);
     switch (ret) {
         case OK:
             // Expected, do nothing.
@@ -708,6 +795,7 @@ binder::Status CameraDeviceClient::deleteStream(int streamId) {
             }
         }
 
+        Mutex::Autolock l(mCompositeLock);
         for (size_t i = 0; i < mCompositeStreamMap.size(); ++i) {
             if (streamId == mCompositeStreamMap.valueAt(i)->getStreamId()) {
                 compositeIndex = i;
@@ -746,6 +834,7 @@ binder::Status CameraDeviceClient::deleteStream(int streamId) {
             }
 
             if (compositeIndex != NAME_NOT_FOUND) {
+                Mutex::Autolock l(mCompositeLock);
                 status_t ret;
                 if ((ret = mCompositeStreamMap.valueAt(compositeIndex)->deleteStream())
                         != OK) {
@@ -789,8 +878,12 @@ binder::Status CameraDeviceClient::createStream(
     String8 physicalCameraId = String8(outputConfiguration.getPhysicalCameraId());
     bool deferredConsumerOnly = deferredConsumer && numBufferProducers == 0;
     bool isMultiResolution = outputConfiguration.isMultiResolution();
+    int64_t dynamicRangeProfile = outputConfiguration.getDynamicRangeProfile();
+    int64_t streamUseCase = outputConfiguration.getStreamUseCase();
+    int timestampBase = outputConfiguration.getTimestampBase();
+    int mirrorMode = outputConfiguration.getMirrorMode();
 
-    res = camera3::SessionConfigurationUtils::checkSurfaceType(numBufferProducers, deferredConsumer,
+    res = SessionConfigurationUtils::checkSurfaceType(numBufferProducers, deferredConsumer,
             outputConfiguration.getSurfaceType());
     if (!res.isOk()) {
         return res;
@@ -799,7 +892,7 @@ binder::Status CameraDeviceClient::createStream(
     if (!mDevice.get()) {
         return STATUS_ERROR(CameraService::ERROR_DISCONNECTED, "Camera device no longer alive");
     }
-    res = camera3::SessionConfigurationUtils::checkPhysicalCameraId(mPhysicalCameraIds,
+    res = SessionConfigurationUtils::checkPhysicalCameraId(mPhysicalCameraIds,
             physicalCameraId, mCameraIdStr);
     if (!res.isOk()) {
         return res;
@@ -830,9 +923,10 @@ binder::Status CameraDeviceClient::createStream(
         }
 
         sp<Surface> surface;
-        res = camera3::SessionConfigurationUtils::createSurfaceFromGbp(streamInfo,
+        res = SessionConfigurationUtils::createSurfaceFromGbp(streamInfo,
                 isStreamInfoValid, surface, bufferProducer, mCameraIdStr,
-                mDevice->infoPhysical(physicalCameraId), sensorPixelModesUsed);
+                mDevice->infoPhysical(physicalCameraId), sensorPixelModesUsed, dynamicRangeProfile,
+                streamUseCase, timestampBase, mirrorMode);
 
         if (!res.isOk())
             return res;
@@ -844,6 +938,11 @@ binder::Status CameraDeviceClient::createStream(
         binders.push_back(IInterface::asBinder(bufferProducer));
         surfaces.push_back(surface);
     }
+
+    // If mOverrideForPerfClass is true, do not fail createStream() for small
+    // JPEG sizes because existing createSurfaceFromGbp() logic will find the
+    // closest possible supported size.
+
     int streamId = camera3::CAMERA3_STREAM_ID_INVALID;
     std::vector<int> surfaceIds;
     bool isDepthCompositeStream =
@@ -863,6 +962,7 @@ binder::Status CameraDeviceClient::createStream(
                 &streamId, physicalCameraId, streamInfo.sensorPixelModesUsed, &surfaceIds,
                 outputConfiguration.getSurfaceSetID(), isShared, isMultiResolution);
         if (err == OK) {
+            Mutex::Autolock l(mCompositeLock);
             mCompositeStreamMap.add(IInterface::asBinder(surfaces[0]->getIGraphicBufferProducer()),
                     compositeStream);
         }
@@ -871,7 +971,9 @@ binder::Status CameraDeviceClient::createStream(
                 streamInfo.height, streamInfo.format, streamInfo.dataSpace,
                 static_cast<camera_stream_rotation_t>(outputConfiguration.getRotation()),
                 &streamId, physicalCameraId, streamInfo.sensorPixelModesUsed, &surfaceIds,
-                outputConfiguration.getSurfaceSetID(), isShared, isMultiResolution);
+                outputConfiguration.getSurfaceSetID(), isShared, isMultiResolution,
+                /*consumerUsage*/0, streamInfo.dynamicRangeProfile, streamInfo.streamUseCase,
+                streamInfo.timestampBase, streamInfo.mirrorMode);
     }
 
     if (err != OK) {
@@ -897,7 +999,7 @@ binder::Status CameraDeviceClient::createStream(
                   streamInfo.height, streamInfo.format);
 
         // Set transform flags to ensure preview to be rotated correctly.
-        res = setStreamTransformLocked(streamId);
+        res = setStreamTransformLocked(streamId, streamInfo.mirrorMode);
 
         // Fill in mHighResolutionCameraIdToStreamIdSet map
         const String8 &cameraIdUsed =
@@ -951,7 +1053,7 @@ binder::Status CameraDeviceClient::createDeferredSurfaceStreamLocked(
     std::unordered_set<int32_t> overriddenSensorPixelModesUsed;
     const std::vector<int32_t> &sensorPixelModesUsed =
             outputConfiguration.getSensorPixelModesUsed();
-    if (camera3::SessionConfigurationUtils::checkAndOverrideSensorPixelModesUsed(
+    if (SessionConfigurationUtils::checkAndOverrideSensorPixelModesUsed(
             sensorPixelModesUsed, format, width, height, getStaticInfo(cameraIdUsed),
             /*allowRounding*/ false, &overriddenSensorPixelModesUsed) != OK) {
         return STATUS_ERROR(CameraService::ERROR_ILLEGAL_ARGUMENT,
@@ -965,7 +1067,10 @@ binder::Status CameraDeviceClient::createDeferredSurfaceStreamLocked(
             overriddenSensorPixelModesUsed,
             &surfaceIds,
             outputConfiguration.getSurfaceSetID(), isShared,
-            outputConfiguration.isMultiResolution(), consumerUsage);
+            outputConfiguration.isMultiResolution(), consumerUsage,
+            outputConfiguration.getDynamicRangeProfile(),
+            outputConfiguration.getStreamUseCase(),
+            outputConfiguration.getMirrorMode());
 
     if (err != OK) {
         res = STATUS_ERROR_FMT(CameraService::ERROR_INVALID_OPERATION,
@@ -978,14 +1083,18 @@ binder::Status CameraDeviceClient::createDeferredSurfaceStreamLocked(
         mDeferredStreams.push_back(streamId);
         mStreamInfoMap.emplace(std::piecewise_construct, std::forward_as_tuple(streamId),
                 std::forward_as_tuple(width, height, format, dataSpace, consumerUsage,
-                        overriddenSensorPixelModesUsed));
+                        overriddenSensorPixelModesUsed,
+                        outputConfiguration.getDynamicRangeProfile(),
+                        outputConfiguration.getStreamUseCase(),
+                        outputConfiguration.getTimestampBase(),
+                        outputConfiguration.getMirrorMode()));
 
         ALOGV("%s: Camera %s: Successfully created a new stream ID %d for a deferred surface"
                 " (%d x %d) stream with format 0x%x.",
               __FUNCTION__, mCameraIdStr.string(), streamId, width, height, format);
 
         // Set transform flags to ensure preview to be rotated correctly.
-        res = setStreamTransformLocked(streamId);
+        res = setStreamTransformLocked(streamId, outputConfiguration.getMirrorMode());
 
         *newStreamId = streamId;
         // Fill in mHighResolutionCameraIdToStreamIdSet
@@ -999,7 +1108,7 @@ binder::Status CameraDeviceClient::createDeferredSurfaceStreamLocked(
     return res;
 }
 
-binder::Status CameraDeviceClient::setStreamTransformLocked(int streamId) {
+binder::Status CameraDeviceClient::setStreamTransformLocked(int streamId, int mirrorMode) {
     int32_t transform = 0;
     status_t err;
     binder::Status res;
@@ -1008,7 +1117,7 @@ binder::Status CameraDeviceClient::setStreamTransformLocked(int streamId) {
         return STATUS_ERROR(CameraService::ERROR_DISCONNECTED, "Camera device no longer alive");
     }
 
-    err = getRotationTransformLocked(&transform);
+    err = getRotationTransformLocked(mirrorMode, &transform);
     if (err != OK) {
         // Error logged by getRotationTransformLocked.
         return STATUS_ERROR(CameraService::ERROR_INVALID_OPERATION,
@@ -1166,13 +1275,18 @@ binder::Status CameraDeviceClient::updateOutputConfiguration(int streamId,
     }
     const std::vector<int32_t> &sensorPixelModesUsed =
             outputConfiguration.getSensorPixelModesUsed();
+    int64_t streamUseCase = outputConfiguration.getStreamUseCase();
+    int timestampBase = outputConfiguration.getTimestampBase();
+    int64_t dynamicRangeProfile = outputConfiguration.getDynamicRangeProfile();
+    int mirrorMode = outputConfiguration.getMirrorMode();
 
     for (size_t i = 0; i < newOutputsMap.size(); i++) {
         OutputStreamInfo outInfo;
         sp<Surface> surface;
-        res = camera3::SessionConfigurationUtils::createSurfaceFromGbp(outInfo,
+        res = SessionConfigurationUtils::createSurfaceFromGbp(outInfo,
                 /*isStreamInfoValid*/ false, surface, newOutputsMap.valueAt(i), mCameraIdStr,
-                mDevice->infoPhysical(physicalCameraId), sensorPixelModesUsed);
+                mDevice->infoPhysical(physicalCameraId), sensorPixelModesUsed, dynamicRangeProfile,
+                streamUseCase, timestampBase, mirrorMode);
         if (!res.isOk())
             return res;
 
@@ -1529,6 +1643,10 @@ binder::Status CameraDeviceClient::finalizeOutputConfigurations(int32_t streamId
     std::vector<sp<Surface>> consumerSurfaces;
     const std::vector<int32_t> &sensorPixelModesUsed =
             outputConfiguration.getSensorPixelModesUsed();
+    int64_t dynamicRangeProfile = outputConfiguration.getDynamicRangeProfile();
+    int64_t streamUseCase= outputConfiguration.getStreamUseCase();
+    int timestampBase = outputConfiguration.getTimestampBase();
+    int mirrorMode = outputConfiguration.getMirrorMode();
     for (auto& bufferProducer : bufferProducers) {
         // Don't create multiple streams for the same target surface
         ssize_t index = mStreamMap.indexOfKey(IInterface::asBinder(bufferProducer));
@@ -1539,9 +1657,10 @@ binder::Status CameraDeviceClient::finalizeOutputConfigurations(int32_t streamId
         }
 
         sp<Surface> surface;
-        res = camera3::SessionConfigurationUtils::createSurfaceFromGbp(mStreamInfoMap[streamId],
+        res = SessionConfigurationUtils::createSurfaceFromGbp(mStreamInfoMap[streamId],
                 true /*isStreamInfoValid*/, surface, bufferProducer, mCameraIdStr,
-                mDevice->infoPhysical(physicalId), sensorPixelModesUsed);
+                mDevice->infoPhysical(physicalId), sensorPixelModesUsed, dynamicRangeProfile,
+                streamUseCase, timestampBase, mirrorMode);
 
         if (!res.isOk())
             return res;
@@ -1614,6 +1733,10 @@ binder::Status CameraDeviceClient::getGlobalAudioRestriction(/*out*/ int32_t* ou
     return binder::Status::ok();
 }
 
+status_t CameraDeviceClient::setCameraServiceWatchdog(bool enabled) {
+    return mDevice->setCameraServiceWatchdog(enabled);
+}
+
 status_t CameraDeviceClient::setRotateAndCropOverride(uint8_t rotateAndCrop) {
     if (rotateAndCrop > ANDROID_SCALER_ROTATE_AND_CROP_AUTO) return BAD_VALUE;
 
@@ -1676,10 +1799,11 @@ binder::Status CameraDeviceClient::switchToOffline(
             return STATUS_ERROR(CameraService::ERROR_ILLEGAL_ARGUMENT, msg.string());
         }
 
+        Mutex::Autolock l(mCompositeLock);
         bool isCompositeStream = false;
-        for (const auto& gbp : mConfiguredOutputs[streamId].getGraphicBufferProducers()) {
+        for (const auto& gbp : mConfiguredOutputs.valueAt(index).getGraphicBufferProducers()) {
             sp<Surface> s = new Surface(gbp, false /*controlledByApp*/);
-            isCompositeStream = camera3::DepthCompositeStream::isDepthCompositeStream(s) |
+            isCompositeStream = camera3::DepthCompositeStream::isDepthCompositeStream(s) ||
                 camera3::HeicCompositeStream::isHeicCompositeStream(s);
             if (isCompositeStream) {
                 auto compositeIdx = mCompositeStreamMap.indexOfKey(IInterface::asBinder(gbp));
@@ -1726,6 +1850,7 @@ binder::Status CameraDeviceClient::switchToOffline(
         mConfiguredOutputs.clear();
         mDeferredStreams.clear();
         mStreamInfoMap.clear();
+        Mutex::Autolock l(mCompositeLock);
         mCompositeStreamMap.clear();
         mInputStream = {false, 0, 0, 0, 0};
     } else {
@@ -1787,16 +1912,50 @@ status_t CameraDeviceClient::dumpClient(int fd, const Vector<String16>& args) {
     return dumpDevice(fd, args);
 }
 
+status_t CameraDeviceClient::startWatchingTags(const String8 &tags, int out) {
+    sp<CameraDeviceBase> device = mDevice;
+    if (!device) {
+        dprintf(out, "  Device is detached.");
+        return OK;
+    }
+    device->startWatchingTags(tags);
+    return OK;
+}
+
+status_t CameraDeviceClient::stopWatchingTags(int out) {
+    sp<CameraDeviceBase> device = mDevice;
+    if (!device) {
+        dprintf(out, "  Device is detached.");
+        return OK;
+    }
+    device->stopWatchingTags();
+    return OK;
+}
+
+status_t CameraDeviceClient::dumpWatchedEventsToVector(std::vector<std::string> &out) {
+    sp<CameraDeviceBase> device = mDevice;
+    if (!device) {
+        return OK;
+    }
+    device->dumpWatchedEventsToVector(out);
+    return OK;
+}
+
 void CameraDeviceClient::notifyError(int32_t errorCode,
                                      const CaptureResultExtras& resultExtras) {
     // Thread safe. Don't bother locking.
     sp<hardware::camera2::ICameraDeviceCallbacks> remoteCb = getRemoteCallback();
 
-    // Composites can have multiple internal streams. Error notifications coming from such internal
-    // streams may need to remain within camera service.
     bool skipClientNotification = false;
-    for (size_t i = 0; i < mCompositeStreamMap.size(); i++) {
-        skipClientNotification |= mCompositeStreamMap.valueAt(i)->onError(errorCode, resultExtras);
+    {
+        // Access to the composite stream map must be synchronized
+        Mutex::Autolock l(mCompositeLock);
+        // Composites can have multiple internal streams. Error notifications coming from such
+        // internal streams may need to remain within camera service.
+        for (size_t i = 0; i < mCompositeStreamMap.size(); i++) {
+            skipClientNotification |= mCompositeStreamMap.valueAt(i)->onError(errorCode,
+                    resultExtras);
+        }
     }
 
     if ((remoteCb != 0) && (!skipClientNotification)) {
@@ -1824,7 +1983,8 @@ void CameraDeviceClient::notifyIdle(
     if (remoteCb != 0) {
         remoteCb->onDeviceIdle();
     }
-    Camera2ClientBase::notifyIdle(requestCount, resultErrorCount, deviceError, streamStats);
+    Camera2ClientBase::notifyIdleWithUserTag(requestCount, resultErrorCount, deviceError,
+            streamStats, mUserTag, mVideoStabilizationMode);
 }
 
 void CameraDeviceClient::notifyShutter(const CaptureResultExtras& resultExtras,
@@ -1836,6 +1996,8 @@ void CameraDeviceClient::notifyShutter(const CaptureResultExtras& resultExtras,
     }
     Camera2ClientBase::notifyShutter(resultExtras, timestamp);
 
+    // Access to the composite stream map must be synchronized
+    Mutex::Autolock l(mCompositeLock);
     for (size_t i = 0; i < mCompositeStreamMap.size(); i++) {
         mCompositeStreamMap.valueAt(i)->onShutter(resultExtras, timestamp);
     }
@@ -1863,13 +2025,15 @@ void CameraDeviceClient::detachDevice() {
     nsecs_t startTime = systemTime();
     ALOGV("Camera %s: Stopping processors", mCameraIdStr.string());
 
-    mFrameProcessor->removeListener(camera2::FrameProcessorBase::FRAME_PROCESSOR_LISTENER_MIN_ID,
-                                    camera2::FrameProcessorBase::FRAME_PROCESSOR_LISTENER_MAX_ID,
-                                    /*listener*/this);
-    mFrameProcessor->requestExit();
-    ALOGV("Camera %s: Waiting for threads", mCameraIdStr.string());
-    mFrameProcessor->join();
-    ALOGV("Camera %s: Disconnecting device", mCameraIdStr.string());
+    if (mFrameProcessor.get() != nullptr) {
+        mFrameProcessor->removeListener(
+                camera2::FrameProcessorBase::FRAME_PROCESSOR_LISTENER_MIN_ID,
+                camera2::FrameProcessorBase::FRAME_PROCESSOR_LISTENER_MAX_ID, /*listener*/this);
+        mFrameProcessor->requestExit();
+        ALOGV("Camera %s: Waiting for threads", mCameraIdStr.string());
+        mFrameProcessor->join();
+        ALOGV("Camera %s: Disconnecting device", mCameraIdStr.string());
+    }
 
     // WORKAROUND: HAL refuses to disconnect while there's streams in flight
     {
@@ -1885,14 +2049,17 @@ void CameraDeviceClient::detachDevice() {
         }
     }
 
-    for (size_t i = 0; i < mCompositeStreamMap.size(); i++) {
-        auto ret = mCompositeStreamMap.valueAt(i)->deleteInternalStreams();
-        if (ret != OK) {
-            ALOGE("%s: Failed removing composite stream  %s (%d)", __FUNCTION__,
-                    strerror(-ret), ret);
+    {
+        Mutex::Autolock l(mCompositeLock);
+        for (size_t i = 0; i < mCompositeStreamMap.size(); i++) {
+            auto ret = mCompositeStreamMap.valueAt(i)->deleteInternalStreams();
+            if (ret != OK) {
+                ALOGE("%s: Failed removing composite stream  %s (%d)", __FUNCTION__,
+                        strerror(-ret), ret);
+            }
         }
+        mCompositeStreamMap.clear();
     }
-    mCompositeStreamMap.clear();
 
     Camera2ClientBase::detachDevice();
 
@@ -1912,6 +2079,8 @@ void CameraDeviceClient::onResultAvailable(const CaptureResult& result) {
                 result.mPhysicalMetadatas);
     }
 
+    // Access to the composite stream map must be synchronized
+    Mutex::Autolock l(mCompositeLock);
     for (size_t i = 0; i < mCompositeStreamMap.size(); i++) {
         mCompositeStreamMap.valueAt(i)->onResultAvailable(result);
     }
@@ -1980,11 +2149,12 @@ bool CameraDeviceClient::enforceRequestPermissions(CameraMetadata& metadata) {
     return true;
 }
 
-status_t CameraDeviceClient::getRotationTransformLocked(int32_t* transform) {
+status_t CameraDeviceClient::getRotationTransformLocked(int mirrorMode,
+        int32_t* transform) {
     ALOGV("%s: begin", __FUNCTION__);
 
     const CameraMetadata& staticInfo = mDevice->info();
-    return CameraUtils::getRotationTransform(staticInfo, transform);
+    return CameraUtils::getRotationTransform(staticInfo, mirrorMode, transform);
 }
 
 binder::Status CameraDeviceClient::mapRequestTemplate(int templateId,
@@ -2034,7 +2204,7 @@ const CameraMetadata &CameraDeviceClient::getStaticInfo(const String8 &cameraId)
 
 bool CameraDeviceClient::isUltraHighResolutionSensor(const String8 &cameraId) {
     const CameraMetadata &deviceInfo = getStaticInfo(cameraId);
-    return camera3::SessionConfigurationUtils::isUltraHighResolutionSensor(deviceInfo);
+    return SessionConfigurationUtils::isUltraHighResolutionSensor(deviceInfo);
 }
 
 bool CameraDeviceClient::isSensorPixelModeConsistent(

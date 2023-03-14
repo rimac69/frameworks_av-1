@@ -30,16 +30,19 @@
 #include <media/AidlConversion.h>
 #include <media/AudioResamplerPublic.h>
 #include <media/AudioSystem.h>
+#include <media/AudioTrack.h>
 #include <media/MediaPlayerInterface.h>
 #include <media/Metadata.h>
 #include <media/stagefright/foundation/ABase.h>
-#include <android/media/permission/Identity.h>
+#include <mediautils/Synchronization.h>
+#include <android/content/AttributionSourceState.h>
 
 #include <system/audio.h>
 
 namespace android {
 
-class AudioTrack;
+using content::AttributionSourceState;
+
 struct AVSyncSettings;
 class DeathNotifier;
 class IDataSource;
@@ -80,7 +83,7 @@ class MediaPlayerService : public BnMediaPlayerService
      public:
                                 AudioOutput(
                                         audio_session_t sessionId,
-                                        const media::permission::Identity& identity,
+                                        const AttributionSourceState& attributionSource,
                                         const audio_attributes_t * attr,
                                         const sp<AudioSystem::AudioDeviceCallback>& deviceCallback);
         virtual                 ~AudioOutput();
@@ -159,7 +162,7 @@ class MediaPlayerService : public BnMediaPlayerService
         sp<AudioOutput>         mNextOutput;
         AudioCallback           mCallback;
         void *                  mCallbackCookie;
-        CallbackData *          mCallbackData;
+        sp<CallbackData>        mCallbackData;
         audio_stream_type_t     mStreamType;
         audio_attributes_t *    mAttributes;
         float                   mLeftVolume;
@@ -169,7 +172,7 @@ class MediaPlayerService : public BnMediaPlayerService
         float                   mMsecsPerFrame;
         size_t                  mFrameSize;
         audio_session_t         mSessionId;
-        media::permission::Identity mIdentity;
+        AttributionSourceState  mAttributionSource;
         float                   mSendLevel;
         int                     mAuxEffectId;
         audio_output_flags_t    mFlags;
@@ -187,15 +190,15 @@ class MediaPlayerService : public BnMediaPlayerService
         // CallbackData is what is passed to the AudioTrack as the "user" data.
         // We need to be able to target this to a different Output on the fly,
         // so we can't use the Output itself for this.
-        class CallbackData {
+        class CallbackData : public AudioTrack::IAudioTrackCallback {
             friend AudioOutput;
         public:
-            explicit CallbackData(AudioOutput *cookie) {
+            explicit CallbackData(const wp<AudioOutput>& cookie) {
                 mData = cookie;
                 mSwitching = false;
             }
-            AudioOutput *   getOutput() const { return mData; }
-            void            setOutput(AudioOutput* newcookie) { mData = newcookie; }
+            sp<AudioOutput> getOutput() const { return mData.load().promote(); }
+            void            setOutput(const wp<AudioOutput>& newcookie) { mData.store(newcookie); }
             // lock/unlock are used by the callback before accessing the payload of this object
             void            lock() const { mLock.lock(); }
             void            unlock() const { mLock.unlock(); }
@@ -218,8 +221,13 @@ class MediaPlayerService : public BnMediaPlayerService
                 }
                 mSwitching = false;
             }
+        protected:
+            size_t onMoreData(const AudioTrack::Buffer& buffer) override;
+            void onUnderrun() override;
+            void onStreamEnd() override;
+            void onNewIAudioTrack() override;
         private:
-            AudioOutput *   mData;
+            mediautils::atomic_wp<AudioOutput> mData;
             mutable Mutex   mLock; // a recursive mutex might make this unnecessary.
             bool            mSwitching;
             DISALLOW_EVIL_CONSTRUCTORS(CallbackData);
@@ -231,13 +239,13 @@ public:
     static  void                instantiate();
 
     // IMediaPlayerService interface
-    virtual sp<IMediaRecorder>  createMediaRecorder(const media::permission::Identity &identity);
+    virtual sp<IMediaRecorder> createMediaRecorder(const AttributionSourceState &attributionSource);
     void    removeMediaRecorderClient(const wp<MediaRecorderClient>& client);
     virtual sp<IMediaMetadataRetriever> createMetadataRetriever();
 
     virtual sp<IMediaPlayer>    create(const sp<IMediaPlayerClient>& client,
                                        audio_session_t audioSessionId,
-                                       const media::permission::Identity& identity);
+                                       const AttributionSourceState& attributionSource);
 
     virtual sp<IMediaCodecList> getCodecList() const;
 
@@ -380,7 +388,7 @@ private:
                 void            notify(int msg, int ext1, int ext2, const Parcel *obj);
 
                 pid_t           pid() const {
-                    return VALUE_OR_FATAL(aidl2legacy_int32_t_pid_t(mIdentity.pid));
+                    return VALUE_OR_FATAL(aidl2legacy_int32_t_pid_t(mAttributionSource.pid));
                 }
         virtual status_t        dump(int fd, const Vector<String16>& args);
 
@@ -411,7 +419,7 @@ private:
 
         friend class MediaPlayerService;
                                 Client( const sp<MediaPlayerService>& service,
-                                        const media::permission::Identity& identity,
+                                        const AttributionSourceState& attributionSource,
                                         int32_t connId,
                                         const sp<IMediaPlayerClient>& client,
                                         audio_session_t audioSessionId);
@@ -458,7 +466,7 @@ private:
                     sp<MediaPlayerService>        mService;
                     sp<IMediaPlayerClient>        mClient;
                     sp<AudioOutput>               mAudioOutput;
-                    const media::permission::Identity mIdentity;
+                    const AttributionSourceState  mAttributionSource;
                     status_t                      mStatus;
                     bool                          mLoop;
                     int32_t                       mConnId;

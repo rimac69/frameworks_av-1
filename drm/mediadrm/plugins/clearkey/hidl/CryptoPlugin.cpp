@@ -27,7 +27,7 @@
 namespace android {
 namespace hardware {
 namespace drm {
-namespace V1_2 {
+namespace V1_4 {
 namespace clearkey {
 
 using ::android::hardware::drm::V1_0::BufferType;
@@ -206,6 +206,11 @@ Return<void> CryptoPlugin::decrypt_1_2(
         return Void();
     } else if (mode == Mode::AES_CTR) {
         size_t bytesDecrypted;
+        if (keyId.size() != kBlockSize || iv.size() != kBlockSize) {
+            android_errorWriteLog(0x534e4554, "244569759");
+            _hidl_cb(Status_V1_2::ERROR_DRM_CANNOT_HANDLE, 0, "invalid decrypt parameter size");
+            return Void();
+        }
         Status_V1_2 res = mSession->decrypt(keyId.data(), iv.data(), srcPtr,
                 static_cast<uint8_t*>(destPtr), toVector(subSamples), &bytesDecrypted);
         if (res == Status_V1_2::OK) {
@@ -235,8 +240,23 @@ Return<Status> CryptoPlugin::setMediaDrmSession(
     return Status::OK;
 }
 
+Return<void> CryptoPlugin::getLogMessages(
+        getLogMessages_cb _hidl_cb) {
+    using std::chrono::duration_cast;
+    using std::chrono::milliseconds;
+    using std::chrono::system_clock;
+
+    auto timeMillis = duration_cast<milliseconds>(
+            system_clock::now().time_since_epoch()).count();
+
+    std::vector<LogMessage> logs = {
+            { timeMillis, LogPriority::ERROR, std::string("Not implemented") }};
+    _hidl_cb(drm::V1_4::Status::OK, toHidlVec(logs));
+    return Void();
+}
+
 } // namespace clearkey
-} // namespace V1_2
+} // namespace V1_4.
 } // namespace drm
 } // namespace hardware
 } // namespace android

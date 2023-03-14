@@ -32,7 +32,6 @@
 #include "binding/SharedMemoryParcelable.h"
 
 using android::base::unique_fd;
-using android::NO_ERROR;
 using android::status_t;
 using android::media::SharedFileRegion;
 
@@ -59,9 +58,14 @@ SharedMemoryParcelable SharedMemoryParcelable::dup() const {
 }
 
 void SharedMemoryParcelable::setup(const unique_fd& fd, int32_t sizeInBytes) {
-    mFd.reset(::dup(fd.get())); // store a duplicate fd
+    constexpr int minFd = 3; // skip over stdout, stdin and stderr
+    mFd.reset(fcntl(fd.get(), F_DUPFD_CLOEXEC, minFd)); // store a duplicate FD
     ALOGV("setup(fd = %d -> %d, size = %d) this = %p\n", fd.get(), mFd.get(), sizeInBytes, this);
     mSizeInBytes = sizeInBytes;
+}
+
+void SharedMemoryParcelable::setup(const SharedMemoryParcelable &sharedMemoryParcelable) {
+    setup(sharedMemoryParcelable.mFd, sharedMemoryParcelable.mSizeInBytes);
 }
 
 aaudio_result_t SharedMemoryParcelable::close() {
@@ -76,8 +80,16 @@ aaudio_result_t SharedMemoryParcelable::close() {
     return AAUDIO_OK;
 }
 
+aaudio_result_t SharedMemoryParcelable::closeAndReleaseFd() {
+    aaudio_result_t result = close();
+    if (result == AAUDIO_OK) {
+        mFd.reset();
+    }
+    return result;
+}
+
 aaudio_result_t SharedMemoryParcelable::resolveSharedMemory(const unique_fd& fd) {
-    mResolvedAddress = (uint8_t *) mmap(0, mSizeInBytes, PROT_READ | PROT_WRITE,
+    mResolvedAddress = (uint8_t *) mmap(nullptr, mSizeInBytes, PROT_READ | PROT_WRITE,
                                         MAP_SHARED, fd.get(), 0);
     if (mResolvedAddress == MMAP_UNRESOLVED_ADDRESS) {
         ALOGE("mmap() failed for fd = %d, nBytes = %" PRId64 ", errno = %s",

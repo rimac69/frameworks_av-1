@@ -25,6 +25,7 @@
 #include <media/hardware/CryptoAPI.h>
 #include <media/MediaCodecInfo.h>
 #include <media/MediaMetrics.h>
+#include <media/MediaProfiles.h>
 #include <media/stagefright/foundation/AHandler.h>
 #include <media/stagefright/FrameRenderTracker.h>
 #include <utils/Vector.h>
@@ -58,6 +59,7 @@ class IMemory;
 struct PersistentSurface;
 class SoftwareRenderer;
 class Surface;
+class PlaybackDurationAccumulator;
 namespace hardware {
 namespace cas {
 namespace native {
@@ -69,6 +71,13 @@ using hardware::cas::native::V1_0::IDescrambler;
 using aidl::android::media::MediaResourceParcel;
 
 struct MediaCodec : public AHandler {
+    enum Domain {
+        DOMAIN_UNKNOWN = 0,
+        DOMAIN_VIDEO = 1,
+        DOMAIN_AUDIO = 2,
+        DOMAIN_IMAGE = 3
+    };
+
     enum ConfigureFlags {
         CONFIGURE_FLAG_ENCODE           = 1,
         CONFIGURE_FLAG_USE_BLOCK_MODEL  = 2,
@@ -103,6 +112,10 @@ struct MediaCodec : public AHandler {
     static sp<MediaCodec> CreateByType(
             const sp<ALooper> &looper, const AString &mime, bool encoder, status_t *err = NULL,
             pid_t pid = kNoPid, uid_t uid = kNoUid);
+
+    static sp<MediaCodec> CreateByType(
+            const sp<ALooper> &looper, const AString &mime, bool encoder, status_t *err,
+            pid_t pid, uid_t uid, sp<AMessage> format);
 
     static sp<MediaCodec> CreateByComponentName(
             const sp<ALooper> &looper, const AString &name, status_t *err = NULL,
@@ -343,6 +356,7 @@ private:
         kWhatSetNotification                = 'setN',
         kWhatDrmReleaseCrypto               = 'rDrm',
         kWhatCheckBatteryStats              = 'chkB',
+        kWhatGetMetrics                     = 'getM',
     };
 
     enum {
@@ -372,15 +386,24 @@ private:
     // This type is used to track the tunnel mode video peek state machine:
     //
     // DisabledNoBuffer -> EnabledNoBuffer  when tunnel-peek = true
+    // DisabledQueued   -> EnabledQueued    when tunnel-peek = true
+    // DisabledNoBuffer -> DisabledQueued   when first frame queued
     // EnabledNoBuffer  -> DisabledNoBuffer when tunnel-peek = false
+    // EnabledQueued    -> DisabledQueued   when tunnel-peek = false
+    // EnabledNoBuffer  -> EnabledQueued    when first frame queued
     // DisabledNoBuffer -> BufferDecoded    when kWhatFirstTunnelFrameReady
+    // DisabledQueued   -> BufferDecoded    when kWhatFirstTunnelFrameReady
     // EnabledNoBuffer  -> BufferDecoded    when kWhatFirstTunnelFrameReady
+    // EnabledQueued    -> BufferDecoded    when kWhatFirstTunnelFrameReady
     // BufferDecoded    -> BufferRendered   when kWhatFrameRendered
     // <all states>     -> EnabledNoBuffer  when flush
     // <all states>     -> EnabledNoBuffer  when stop then configure then start
     enum struct TunnelPeekState {
+        kLegacyMode,
         kDisabledNoBuffer,
         kEnabledNoBuffer,
+        kDisabledQueued,
+        kEnabledQueued,
         kBufferDecoded,
         kBufferRendered,
     };
@@ -388,7 +411,6 @@ private:
     struct ResourceManagerServiceProxy;
 
     State mState;
-    uid_t mUid;
     bool mReleasedByResourceManager;
     sp<ALooper> mLooper;
     sp<ALooper> mCodecLooper;
@@ -400,10 +422,12 @@ private:
     std::string mLastReplyOrigin;
     std::vector<sp<AMessage>> mDeferredMessages;
     uint32_t mFlags;
+    int64_t mPresentationTimeUs = 0;
     status_t mStickyError;
     sp<Surface> mSurface;
     SoftwareRenderer *mSoftRenderer;
 
+    Mutex mMetricsLock;
     mediametrics_handle_t mMetricsHandle = 0;
     nsecs_t mLifetimeStartNs = 0;
     void initMediametrics();
@@ -411,8 +435,10 @@ private:
     void flushMediametrics();
     void updateEphemeralMediametrics(mediametrics_handle_t item);
     void updateLowLatency(const sp<AMessage> &msg);
+    void onGetMetrics(const sp<AMessage>& msg);
     constexpr const char *asString(TunnelPeekState state, const char *default_string="?");
     void updateTunnelPeek(const sp<AMessage> &msg);
+    void updatePlaybackDuration(const sp<AMessage> &msg);
 
     sp<AMessage> mOutputFormat;
     sp<AMessage> mInputFormat;
@@ -423,12 +449,26 @@ private:
 
     sp<ResourceManagerServiceProxy> mResourceManagerProxy;
 
-    bool mIsVideo;
+    Domain mDomain;
     AString mLogSessionId;
-    int32_t mVideoWidth;
-    int32_t mVideoHeight;
+    int32_t mWidth;
+    int32_t mHeight;
     int32_t mRotationDegrees;
     int32_t mAllowFrameDroppingBySurface;
+
+    enum {
+        kFlagHasHdrStaticInfo   = 1,
+        kFlagHasHdr10PlusInfo   = 2,
+    };
+    uint32_t mHdrInfoFlags;
+    void updateHdrMetrics(bool isConfig);
+    hdr_format getHdrFormat(const AString &mime, const int32_t profile,
+            const int32_t colorTransfer);
+    hdr_format getHdrFormatForEncoder(const AString &mime, const int32_t profile,
+            const int32_t colorTransfer);
+    hdr_format getHdrFormatForDecoder(const AString &mime, const int32_t profile,
+            const int32_t colorTransfer);
+    bool profileSupport10Bits(const AString &mime, const int32_t profile);
 
     // initial create parameters
     AString mInitName;
@@ -441,7 +481,8 @@ private:
     // the (possibly) updated format is returned in place.
     status_t shapeMediaFormat(
             const sp<AMessage> &format,
-            uint32_t flags);
+            uint32_t flags,
+            mediametrics_handle_t handle);
 
     // populate the format shaper library with information for this codec encoding
     // for the indicated media type
@@ -480,6 +521,9 @@ private:
     bool mCpuBoostRequested;
 
     std::shared_ptr<BufferChannelBase> mBufferChannel;
+
+    std::unique_ptr<PlaybackDurationAccumulator> mPlaybackDurationAccumulator;
+    bool mIsSurfaceToScreen;
 
     MediaCodec(
             const sp<ALooper> &looper, pid_t pid, uid_t uid,
@@ -573,8 +617,9 @@ private:
     int64_t mBytesEncoded = 0;
     int64_t mEarliestEncodedPtsUs = INT64_MAX;
     int64_t mLatestEncodedPtsUs = INT64_MIN;
-    int32_t mFramesEncoded = 0;
-
+    int64_t mFramesEncoded = 0;
+    int64_t mBytesInput = 0;
+    int64_t mFramesInput = 0;
 
     int64_t mNumLowLatencyEnables;  // how many times low latency mode is enabled
     int64_t mNumLowLatencyDisables;  // how many times low latency mode is disabled
@@ -591,7 +636,7 @@ private:
 
     sp<BatteryChecker> mBatteryChecker;
 
-    void statsBufferSent(int64_t presentationUs);
+    void statsBufferSent(int64_t presentationUs, const sp<MediaCodecBuffer> &buffer);
     void statsBufferReceived(int64_t presentationUs, const sp<MediaCodecBuffer> &buffer);
 
     enum {

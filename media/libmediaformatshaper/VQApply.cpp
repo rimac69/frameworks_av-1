@@ -49,14 +49,6 @@ namespace mediaformatshaper {
 static const int BITRATE_MODE_VBR = 1;
 
 
-// constants we use within the calculations
-//
-constexpr double BITRATE_LEAVE_UNTOUCHED = 1.75;
-
-// 20% bump if QP is configured but it is unavailable
-constexpr double BITRATE_QP_UNAVAILABLE_BOOST = 0.20;
-
-
 //
 // Caller retains ownership of and responsibility for inFormat
 //
@@ -71,12 +63,61 @@ int VQApply(CodecProperties *codec, vqOps_t *info, AMediaFormat* inFormat, int f
         return 0;
     }
 
-    if (codec->supportedMinimumQuality() > 0) {
-        // allow the codec provided minimum quality behavior to work at it
-        ALOGD("minquality: codec claims to implement minquality=%d",
-              codec->supportedMinimumQuality());
+    // only proceed if we're in the handheld category.
+    // We embed this information within the codec record when we build up features
+    // and pass them in from MediaCodec; it's the easiest place to store it
+    //
+    // TODO: make a #define for ' _vq_eligible.device' here and in MediaCodec.cpp
+    //
+    int32_t isVQEligible = 0;
+    (void) codec->getFeatureValue("_vq_eligible.device", &isVQEligible);
+    if (!isVQEligible) {
+        ALOGD("minquality: not an eligible device class");
         return 0;
     }
+
+    // look at resolution to determine if we want any shaping/modification at all.
+    //
+    // we currently only shape (or ask the underlying codec to shape) for
+    // resolution range  320x240 < target <= 1920x1080
+    // NB: the < vs <=, that is deliberate.
+    //
+
+    int32_t width = 0;
+    (void) AMediaFormat_getInt32(inFormat, AMEDIAFORMAT_KEY_WIDTH, &width);
+    int32_t height = 0;
+    (void) AMediaFormat_getInt32(inFormat, AMEDIAFORMAT_KEY_HEIGHT, &height);
+    int64_t pixels = ((int64_t)width) * height;
+
+    bool eligibleSize = true;
+    if (pixels <= 320 * 240) {
+        eligibleSize = false;
+    } else if (pixels > 1920 * 1088) {
+        eligibleSize = false;
+    }
+
+    if (!eligibleSize) {
+        // we won't shape, and ask that the codec not shape
+        ALOGD("minquality: %dx%d outside of shaping range", width, height);
+        AMediaFormat_setInt32(inFormat, "android._encoding-quality-level", 0);
+        return 0;
+    }
+
+    if (codec->supportedMinimumQuality() > 0) {
+        // have the codec-provided minimum quality behavior to work at it
+        ALOGD("minquality: codec claims to implement minquality=%d",
+              codec->supportedMinimumQuality());
+
+        // tell the underlying codec to do its thing; we won't try to second guess.
+        // default to 1, aka S_HANDHELD;
+        int32_t qualityTarget = 1;
+        (void) codec->getFeatureValue("_quality.target", &qualityTarget);
+        AMediaFormat_setInt32(inFormat, "android._encoding-quality-level", qualityTarget);
+        return 0;
+    }
+
+    // let the codec know that we'll be enforcing the minimum quality standards
+    AMediaFormat_setInt32(inFormat, "android._encoding-quality-level", 0);
 
     //
     // consider any and all tools available
@@ -92,15 +133,12 @@ int VQApply(CodecProperties *codec, vqOps_t *info, AMediaFormat* inFormat, int f
     bitrateConfigured = bitrateConfiguredTmp;
     bitrateChosen = bitrateConfigured;
 
-    int32_t width = 0;
-    (void) AMediaFormat_getInt32(inFormat, AMEDIAFORMAT_KEY_WIDTH, &width);
-    int32_t height = 0;
-    (void) AMediaFormat_getInt32(inFormat, AMEDIAFORMAT_KEY_HEIGHT, &height);
-    int64_t pixels = ((int64_t)width) * height;
+    // width, height, and pixels are calculated above
+
     double minimumBpp = codec->getBpp(width, height);
 
     int64_t bitrateFloor = pixels * minimumBpp;
-    int64_t bitrateCeiling = bitrateFloor * BITRATE_LEAVE_UNTOUCHED;
+    int64_t bitrateCeiling = bitrateFloor * codec->getPhaseOut();
     if (bitrateFloor > INT32_MAX) bitrateFloor = INT32_MAX;
     if (bitrateCeiling > INT32_MAX) bitrateCeiling = INT32_MAX;
 
@@ -123,7 +161,7 @@ int VQApply(CodecProperties *codec, vqOps_t *info, AMediaFormat* inFormat, int f
     bool qpPresent = hasQpMax(inFormat);
 
     // calculate a target QP value
-    int32_t qpmax = codec->targetQpMax();
+    int32_t qpmax = codec->targetQpMax(width, height);
     if (!qpPresent) {
         // user didn't, so shaper wins
         if (qpmax != INT32_MAX) {
@@ -144,8 +182,7 @@ int VQApply(CodecProperties *codec, vqOps_t *info, AMediaFormat* inFormat, int f
     // if QP is desired but not supported, compensate with additional bits
     if (!codec->supportsQp()) {
         if (qpChosen != INT32_MAX) {
-            int64_t boost = 0;
-            boost = bitrateChosen * BITRATE_QP_UNAVAILABLE_BOOST;
+            int64_t boost = bitrateChosen * codec->getMissingQpBoost();
             ALOGD("minquality: requested QP unsupported, boost bitrate %" PRId64 " by %" PRId64,
                 bitrateChosen, boost);
             bitrateChosen =  bitrateChosen + boost;
@@ -165,7 +202,7 @@ int VQApply(CodecProperties *codec, vqOps_t *info, AMediaFormat* inFormat, int f
 
     if (bitrateChosen != bitrateConfigured) {
         if (bitrateChosen > bitrateCeiling) {
-            ALOGD("minquality: bitrate clamped at ceiling %" PRId64,  bitrateCeiling);
+            ALOGD("minquality: bitrate increase clamped at ceiling %" PRId64,  bitrateCeiling);
             bitrateChosen = bitrateCeiling;
         }
         ALOGD("minquality/target bitrate raised from %" PRId64 " to %" PRId64 " bps",

@@ -149,7 +149,8 @@ status_t CameraSource::isCameraAvailable(
     int32_t cameraId, const String16& clientName, uid_t clientUid, pid_t clientPid) {
 
     if (camera == 0) {
-        mCamera = Camera::connect(cameraId, clientName, clientUid, clientPid);
+        mCamera = Camera::connect(cameraId, clientName, clientUid, clientPid,
+                /*targetSdkVersion*/__ANDROID_API_FUTURE__, /*overrideToPortrait*/true);
         if (mCamera == 0) return -EBUSY;
         mCameraFlags &= ~FLAGS_HOT_CAMERA;
     } else {
@@ -563,9 +564,11 @@ status_t CameraSource::initWithCameraAccess(
     // Set the preview display. Skip this if mSurface is null because
     // applications may already set a surface to the camera.
     if (mSurface != NULL) {
-        // This CHECK is good, since we just passed the lock/unlock
-        // check earlier by calling mCamera->setParameters().
-        CHECK_EQ((status_t)OK, mCamera->setPreviewTarget(mSurface));
+        // Surface may be set incorrectly or could already be used even if we just
+        // passed the lock/unlock check earlier by calling mCamera->setParameters().
+        if ((err = mCamera->setPreviewTarget(mSurface)) != OK) {
+            return err;
+        }
     }
 
     // Use buffer queue to receive video buffers from camera

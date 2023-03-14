@@ -18,7 +18,7 @@
 #include <utils/Log.h>
 
 #include <algorithm>
-#include <audio_utils/primitives.h>
+#include <audio_utils/format.h>
 #include <aaudio/AAudio.h>
 #include <media/MediaMetricsItem.h>
 
@@ -45,8 +45,6 @@ AudioStreamInternalCapture::AudioStreamInternalCapture(AAudioServiceInterface  &
     : AudioStreamInternal(serviceInterface, inService) {
 
 }
-
-AudioStreamInternalCapture::~AudioStreamInternalCapture() {}
 
 void AudioStreamInternalCapture::advanceClientToMatchServerPosition(int32_t serverMargin) {
     int64_t readCounter = mAudioEndpoint->getDataReadCounter();
@@ -109,7 +107,7 @@ aaudio_result_t AudioStreamInternalCapture::processDataNow(void *buffer, int32_t
     if (mNeedCatchUp.isRequested()) {
         // Catch an MMAP pointer that is already advancing.
         // This will avoid initial underruns caused by a slow cold start.
-        advanceClientToMatchServerPosition();
+        advanceClientToMatchServerPosition(0 /*serverMargin*/);
         mNeedCatchUp.acknowledge();
     }
 
@@ -190,26 +188,10 @@ aaudio_result_t AudioStreamInternalCapture::readNowWithConversion(void *buffer,
 
         const audio_format_t sourceFormat = getDeviceFormat();
         const audio_format_t destinationFormat = getFormat();
-        // TODO factor this out into a utility function
-        if (sourceFormat == destinationFormat) {
-            memcpy(destination, wrappingBuffer.data[partIndex], numBytes);
-        } else if (sourceFormat == AUDIO_FORMAT_PCM_16_BIT
-                   && destinationFormat == AUDIO_FORMAT_PCM_FLOAT) {
-            memcpy_to_float_from_i16(
-                    (float *) destination,
-                    (const int16_t *) wrappingBuffer.data[partIndex],
-                    numSamples);
-        } else if (sourceFormat == AUDIO_FORMAT_PCM_FLOAT
-                   && destinationFormat == AUDIO_FORMAT_PCM_16_BIT) {
-            memcpy_to_i16_from_float(
-                    (int16_t *) destination,
-                    (const float *) wrappingBuffer.data[partIndex],
-                    numSamples);
-        } else {
-            ALOGE("%s() - Format conversion not supported! audio_format_t source = %u, dest = %u",
-                __func__, sourceFormat, destinationFormat);
-            return AAUDIO_ERROR_INVALID_FORMAT;
-        }
+
+        memcpy_by_audio_format(destination, destinationFormat,
+                wrappingBuffer.data[partIndex], sourceFormat, numSamples);
+
         destination += numBytes;
         framesLeft -= framesToProcess;
     }
@@ -244,7 +226,7 @@ int64_t AudioStreamInternalCapture::getFramesRead() {
 void *AudioStreamInternalCapture::callbackLoop() {
     aaudio_result_t result = AAUDIO_OK;
     aaudio_data_callback_result_t callbackResult = AAUDIO_CALLBACK_RESULT_CONTINUE;
-    if (!isDataCallbackSet()) return NULL;
+    if (!isDataCallbackSet()) return nullptr;
 
     // result might be a frame count
     while (mCallbackEnabled.load() && isActive() && (result >= 0)) {
@@ -276,5 +258,5 @@ void *AudioStreamInternalCapture::callbackLoop() {
 
     ALOGD("callbackLoop() exiting, result = %d, isActive() = %d",
           result, (int) isActive());
-    return NULL;
+    return nullptr;
 }

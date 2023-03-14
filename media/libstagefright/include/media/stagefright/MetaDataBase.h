@@ -60,6 +60,8 @@ enum {
     kKeyAVCC              = 'avcc',  // raw data
     kKeyHVCC              = 'hvcc',  // raw data
     kKeyDVCC              = 'dvcc',  // raw data
+    kKeyDVVC              = 'dvvc',  // raw data
+    kKeyDVWC              = 'dvwc',  // raw data
     kKeyAV1C              = 'av1c',  // raw data
     kKeyThumbnailHVCC     = 'thvc',  // raw data
     kKeyThumbnailAV1C     = 'tav1',  // raw data
@@ -154,6 +156,10 @@ enum {
 
     kKeyIsADTS            = 'adts',  // bool (int32_t)
     kKeyAACAOT            = 'aaot',  // int32_t
+
+    kKeyMpeghProfileLevelIndication = 'hpli', // int32_t
+    kKeyMpeghReferenceChannelLayout = 'hrcl', // int32_t
+    kKeyMpeghCompatibleSets         = 'hcos', // raw data
 
     // If a MediaBuffer's data represents (at least partially) encrypted
     // data, the following fields aid in decryption.
@@ -261,6 +267,7 @@ enum {
     kKeyRtpExtMap        = 'extm', // int32_t, rtp extension ID for cvo on RTP protocol.
     kKeyRtpCvoDegrees    = 'cvod', // int32_t, rtp cvo degrees as per 3GPP 26.114.
     kKeyRtpDscp          = 'dscp', // int32_t, DSCP(Differentiated services codepoint) of RFC 2474.
+    kKeyRtpEcn           = 'sEcn', // int32_t, ECN (Explicit Congestion Notification) of RFC 3168
     kKeySocketNetwork    = 'sNet', // int64_t, socket will be bound to network handle.
 
     // Slow-motion markers
@@ -279,7 +286,10 @@ enum {
     kTypeHVCC        = 'hvcc',
     kTypeAV1C        = 'av1c',
     kTypeDVCC        = 'dvcc',
+    kTypeDVVC        = 'dvvc',
+    kTypeDVWC        = 'dvwc',
     kTypeD263        = 'd263',
+    kTypeHCOS        = 'hcos',
 };
 
 enum {

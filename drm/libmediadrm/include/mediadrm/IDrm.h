@@ -154,18 +154,18 @@ struct IDrm : public virtual RefBase {
 
     virtual status_t setListener(const sp<IDrmClient>& listener) = 0;
 
-    virtual bool requiresSecureDecoder(
-            const char *mime) const = 0;
+    virtual status_t requiresSecureDecoder(const char *mime, bool *required) const = 0;
 
-    virtual bool requiresSecureDecoder(
-            const char *mime,
-            DrmPlugin::SecurityLevel securityLevel) const = 0;
+    virtual status_t requiresSecureDecoder(const char *mime, DrmPlugin::SecurityLevel securityLevel,
+                                           bool *required) const = 0;
 
     virtual status_t setPlaybackId(
             Vector<uint8_t> const &sessionId,
             const char *playbackId) = 0;
 
     virtual status_t getLogMessages(Vector<drm::V1_4::LogMessage> &logs) const = 0;
+
+    virtual status_t getSupportedSchemes(std::vector<uint8_t> &schemes) const = 0;
 
 protected:
     IDrm() {}

@@ -32,7 +32,8 @@
 #include <statslog.h>
 
 #include "MediaMetricsService.h"
-#include "frameworks/proto_logging/stats/enums/stats/mediametrics/mediametrics.pb.h"
+#include "ValidateId.h"
+#include "frameworks/proto_logging/stats/message/mediametrics_message.pb.h"
 #include "iface_statsd.h"
 
 namespace android {
@@ -50,10 +51,7 @@ bool statsd_extractor(const std::shared_ptr<const mediametrics::Item>& item,
 
     // the rest into our own proto
     //
-    ::android::stats::mediametrics::ExtractorData metrics_proto;
-
-    // flesh out the protobuf we'll hand off with our data
-    //
+    ::android::stats::mediametrics_message::ExtractorData metrics_proto;
 
     std::string format;
     if (item->getString("android.media.mediaextractor.fmt", &format)) {
@@ -71,25 +69,25 @@ bool statsd_extractor(const std::shared_ptr<const mediametrics::Item>& item,
     }
 
     std::string entry_point_string;
-    stats::mediametrics::ExtractorData::EntryPoint entry_point =
-            stats::mediametrics::ExtractorData_EntryPoint_OTHER;
+    stats::mediametrics_message::ExtractorData::EntryPoint entry_point =
+            stats::mediametrics_message::ExtractorData_EntryPoint_OTHER;
     if (item->getString("android.media.mediaextractor.entry", &entry_point_string)) {
       if (entry_point_string == "sdk") {
-        entry_point = stats::mediametrics::ExtractorData_EntryPoint_SDK;
+        entry_point = stats::mediametrics_message::ExtractorData_EntryPoint_SDK;
       } else if (entry_point_string == "ndk-with-jvm") {
-        entry_point = stats::mediametrics::ExtractorData_EntryPoint_NDK_WITH_JVM;
+        entry_point = stats::mediametrics_message::ExtractorData_EntryPoint_NDK_WITH_JVM;
       } else if (entry_point_string == "ndk-no-jvm") {
-        entry_point = stats::mediametrics::ExtractorData_EntryPoint_NDK_NO_JVM;
+        entry_point = stats::mediametrics_message::ExtractorData_EntryPoint_NDK_NO_JVM;
       } else {
-        entry_point = stats::mediametrics::ExtractorData_EntryPoint_OTHER;
+        entry_point = stats::mediametrics_message::ExtractorData_EntryPoint_OTHER;
       }
       metrics_proto.set_entry_point(entry_point);
     }
 
-    // android.media.mediaextractor.playbackId        string
-    std::string playback_id;
-    if (item->getString("android.media.mediaextractor.playbackId", &playback_id)) {
-        metrics_proto.set_playback_id(std::move(playback_id));
+    std::string log_session_id;
+    if (item->getString("android.media.mediaextractor.logSessionId", &log_session_id)) {
+        log_session_id = mediametrics::ValidateId::get()->validateId(log_session_id);
+        metrics_proto.set_log_session_id(log_session_id);
     }
 
     std::string serialized;
@@ -116,10 +114,7 @@ bool statsd_extractor(const std::shared_ptr<const mediametrics::Item>& item,
             << " mime:" << mime
             << " tracks:" << tracks
             << " entry_point:" << entry_point_string << "(" << entry_point << ")"
-
-            // TODO: Add MediaExtractor log_session_id
-            // << " log_session_id:" << log_session_id
-
+            << " log_session_id:" << log_session_id
             << " }";
     statsdLog->log(android::util::MEDIAMETRICS_EXTRACTOR_REPORTED, log.str());
     return true;
